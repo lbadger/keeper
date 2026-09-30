@@ -1,0 +1,1379 @@
+# Keeper reference
+
+Detailed behavior, options, and troubleshooting. Start with the [quick guide](../README.md)
+for common commands.
+
+## Full backup
+
+```bash
+./keeper backup --source /opt/audiobooks --level full --device /dev/nst0
+```
+
+There is no `--state` argument. The script inventories file metadata to estimate
+size, loads a tape, and starts GNU tar with its output piped to the tape writer.
+Source file contents are never staged on disk. A successful command prints the
+backup ID on stdout; interactive progress uses stderr and file names go to the log file. Label every cartridge
+with that ID and the volume number shown in the prompt.
+
+**A new full backup requires a blank first cartridge.** Initialize previously used
+media with the explicit `wipe` command, or type `wipe` at the backup's load prompt
+and confirm with `WIPE`. Incrementals always validate the existing tail and write
+after recorded data. Every continuation cartridge must be blank; recorded or
+unreadable cartridges are refused before any write, even after a tape-change prompt.
+Inserting a recorded continuation tape repeats the request for the same volume
+without ending the backup. Buffered data and the local or SSH source stream stay
+active. Load a blank cartridge, type `wipe` to initialize an unrelated used tape
+after confirmation, or type `q` to cancel. Backup never erases automatically;
+pressing Enter alone cannot authorize overwriting recorded data.
+Other drive errors or failures after writing begins still stop the operation when
+they cannot be recovered safely.
+Every backup has its own ID and volume numbers, even when sharing a cartridge.
+
+```mermaid
+flowchart TD
+    A[Choose source directory] --> B[Inventory metadata to estimate size]
+    B --> C[Load fresh writable cartridge]
+    C --> D[GNU tar reads all files and creates a snapshot in RAM]
+    D --> E[Background reader fills a bounded queue]
+    E --> F[Writer continuously drains queue to tape]
+    F --> G{End of medium?}
+    G -->|Yes| H[Rewind and eject; request fresh cartridge and replay unconfirmed frames]
+    H --> F
+    G -->|No, archive finished| I[Write snapshot and completion marker; commit archive]
+    I --> J[Write and commit metadata file: catalog and snapshot copy]
+    J --> K[Print full backup ID; leave tape loaded]
+```
+
+The reader and writer run concurrently. The metadata file is written after the
+archive is committed; its failure handling is described [below](#on-tape-metadata).
+
+Normal backups continue until the drive reports end of medium. For a shorter
+multi-tape trial, use the [hidden test capacity option](#test-multiple-physical-tapes).
+
+Use a filesystem snapshot or quiesce applications while backing up. GNU tar errors,
+including changed/unreadable files, prevent writing the final completion marker.
+This tool does not establish database or application consistency. It includes
+mounted directories beneath the source and does not follow symlinks.
+
+## Incremental backups
+
+An incremental uses the GNU tar snapshot from the previous **completed** backup.
+The snapshot is loaded from tape into RAM; no local `.snar` file is needed.
+For a linear chain, always use the most recent successful backup ID as `--base`.
+
+To use the remaining space on the base backup's final cartridge:
+
+```bash
+./keeper backup --source /opt/audiobooks --level incremental \
+  --base PREVIOUS_BACKUP_ID --device /dev/nst0
+```
+
+Load the base's **final cartridge** at the append prompt. A valid final metadata
+file supplies the snapshot without reading through the archive. For an existing
+legacy backup without that file, the first append reads the base's volumes in
+order to recover its snapshot and check the recorded tail. This can take as long
+as traversing the base on a physical drive. Subsequent completed backups write
+the metadata file for faster lookup; tape positioning still takes time.
+
+Append requires the base to be the last completed backup on that cartridge.
+The source directory and any SSH host/account must match. An incomplete or
+unrecognized tail is refused. Existing backup records are retained. During
+streaming, running out of space automatically rewinds and ejects the current tape,
+prompts for a blank cartridge, and continues the same incremental on the next numbered volume.
+If there is no room even for the initial header, the command stops. It never
+rewinds the base for an overwrite or skips a numbered volume after a header error.
+
+```mermaid
+flowchart TD
+    A[Choose most recent completed backup as base] --> B[Load its final cartridge]
+    B --> C{Valid final metadata file?}
+    C -->|Yes| D[Read catalog and GNU tar snapshot into RAM]
+    C -->|No| E[Scan base volumes to read snapshot and check tail]
+    D --> F[Validate source, latest base, and append position]
+    E --> F
+    F --> G[GNU tar compares current filesystem with snapshot]
+    G --> H[Stream new and changed files plus directory changes]
+    H --> I[Background reader and tape writer run concurrently]
+    I --> J{Space remains on cartridge?}
+    J -->|No| K[Request fresh cartridge and replay unconfirmed frames]
+    K --> I
+    J -->|Yes, archive finished| L[Commit incremental and updated snapshot]
+    L --> M[Write metadata file with updated catalog and snapshot copy]
+    M --> N[Print new backup ID; use it as the next base]
+```
+
+`--append` is accepted for compatibility with existing scripts and has no effect
+on incremental behavior. There is no incremental overwrite mode.
+All ancestors, beginning with the full backup, are required
+to restore an incremental recovery point. A new full starts an independent chain.
+
+### Exclude files and folders
+
+```bash
+./keeper backup --source /opt --level full \
+  --exclude 'cache' --exclude 'config/private.env' --exclude '*.tmp'
+
+./keeper backup --source /opt --level full \
+  --exclude-from /root/backup-excludes.txt
+```
+
+Both options are repeatable and may be combined. Patterns are case-sensitive and
+anchored at the source root: `cache` excludes `/opt/cache` and its descendants,
+while `nested/cache` selects that specific nested directory. `*`, `?`, and bracket
+patterns are supported; wildcards can match `/`, so `*.tmp` also excludes nested
+temporary files. Quote patterns to prevent expansion by your shell. Use
+source-relative paths, not `/opt/...` or `../...`.
+
+Inventory follows GNU tar's matching rules, including POSIX character classes
+such as `[[:digit:]]`, bracket negation, and backslash escapes. `cache\*` matches
+a literal `cache*`; use `cache\\*` to match names beginning with a literal
+backslash after `cache`. A bracket expression such as `[*]` also matches a literal
+asterisk. Character classes follow the source host's locale in both stages.
+
+Exclusion files contain one pattern per line. Empty lines are ignored; spaces and
+`#` are literal, and lines are not shell commands or comments. These files are
+read on the tape host even for SSH backups. The normalized policy is limited to
+16 KiB, recorded on tape, and applied to inventory and archive creation.
+
+Incrementals automatically inherit their parent's exclusions. If you supply
+exclusion options explicitly, the complete resulting policy must match the
+parent's; changing it requires a new full. Older backups without a policy mean
+no exclusions. Restore needs no exclusion file. Rules affect new backups only;
+they do not remove anything from previously recorded tapes.
+
+### How changes are detected
+
+GNU tar's `--listed-incremental` snapshot records directory contents and filesystem
+metadata. Tar uses this snapshot, including timestamps, to select new and changed
+files and record directory changes. Deleted files need no file payload; directory
+records let an incremental restore remove them. Unchanged file contents are not
+read just to decide whether to include them. Snapshot memory grows with the number
+of filenames.
+
+**There is no per-file content-hash manifest.** The SHA-256 checksums on archive
+frames, the complete archive, and the snapshot detect corruption during reading;
+they do not select files for incrementals. Change detection follows GNU tar's
+metadata-based incremental semantics, not a byte-by-byte comparison against the
+full backup. Each incremental compares against its selected base's snapshot,
+which already reflects the preceding chain.
+
+### On-tape metadata
+
+Metadata lives in ordinary tape records. After committing a completed archive,
+the writer adds a separate, checksummed metadata file containing:
+
+- Backup IDs, volume numbers, and positions of backup segments on that cartridge.
+- The latest backup's source, parent ID, completion summary, and checksums.
+- A copy of its updated GNU tar snapshot for preparing the next append.
+- A complete, escaped filename listing for each indexed tar backup completed on
+  that cartridge, including earlier backups retained by appends.
+
+The archive also keeps its original snapshot and completion marker, so the
+metadata file is a lookup aid rather than a new dependency for restoring it.
+Older metadata files stay in place; each successful append adds a newer one.
+
+```mermaid
+flowchart LR
+    F[Full archive and snapshot] --> FM[Metadata: full snapshot and catalog]
+    FM --> I1[Incremental 1 and snapshot]
+    I1 --> M1[Metadata: latest snapshot and expanded catalog]
+    M1 --> I2[Incremental 2 and snapshot]
+    I2 --> M2[Metadata: latest snapshot and expanded catalog]
+    M2 --> E[End of recorded data]
+```
+
+This is a logical layout; filemarks separate committed tape files. If a backup
+spans cartridges, its final metadata file is on the final cartridge and catalogs
+segments on that cartridge. Label physical cartridges separately from backup
+volume numbers: a full's volume 1 and an incremental's volume 1 can share a tape.
+
+If a configured volume cap leaves insufficient room for metadata, the writer
+omits that file and the next append scans the base. If writing the metadata file
+fails after the archive was committed, a warning identifies that condition:
+the completed archive remains available to restore/verify, but a partial tail
+prevents further appends. Preserve that cartridge for restore; a new full backup
+on separate media can start a new chain. The catalog
+is limited to 64 MiB; snapshots are held in RAM. There is no MAM dependency.
+
+## Native ZFS streaming
+
+Use `zfs-backup` to stream an **existing filesystem snapshot** with `zfs send`.
+It uses the same continuous writer, buffers, tape-change protection, and replay
+checks as file backups. It does not create or destroy source snapshots.
+
+```bash
+./keeper zfs-backup --snapshot tank/books@full
+
+# Keep the parent's source snapshot; --base identifies its backup on tape.
+./keeper zfs-backup --snapshot tank/books@next --base PREVIOUS_BACKUP_ID
+
+# Add a different dataset as an independent full backup on the same tape.
+./keeper zfs-backup --snapshot tank/photos@full --append-after LAST_BACKUP_ID
+
+# Read a snapshot from a remote OpenZFS host.
+./keeper zfs-backup --snapshot tank/books@full --ssh backup@fileserver \
+  --remote-program /home/backup/keeper
+
+# Preserve native encryption. Incrementals inherit this mode.
+./keeper zfs-backup --snapshot tank/private@full --raw
+```
+
+The source host needs OpenZFS and permission to query snapshots and send streams.
+The first implementation supports one filesystem dataset per backup, not recursive
+child-dataset replication or zvols. Native streams include dataset properties;
+ordinary sends use compressed records. Encrypted datasets require `--raw` so the
+tool never silently writes a decrypted version to tape. Preserve the encryption
+keys separately. Destination OpenZFS must support the stream's features.
+
+Incrementals validate the original base snapshot GUID, dataset, SSH identity, and
+send mode before writing. A deleted/recreated snapshot with the same name is not
+the same base. Incrementals append to tape; source snapshots must remain available
+until they are no longer needed as incremental bases. File exclusions apply to
+`backup`, not native ZFS send streams.
+
+`--base` means an incremental of the **same dataset**, not just a position on
+tape. To put another dataset, or another independent full snapshot, on the same
+cartridge, use `--append-after LAST_BACKUP_ID` instead. The ID must identify the
+last completed backup on that cartridge; an incomplete tail blocks appending.
+The preceding backup may use a different dataset, source host, send mode, or
+archive type. The new full backup has no restore dependency on it and does not
+inherit its raw mode; specify `--raw` for an encrypted source. Tape rollover
+continues onto blank cartridges when needed. `--base` and `--append-after` cannot
+be combined. Without either option, a full backup requires blank media.
+
+For `ZFS dataset ... differs from parent dataset ...`, use a snapshot of the
+parent dataset with `--base`, or switch to `--append-after` for an independent
+full backup. For a raw-mode mismatch, omit `--raw` to inherit the incremental
+parent's mode. `inspect` shows the recorded dataset, snapshot, and raw mode.
+
+Receive a full chain into a **new child dataset** whose parent already exists:
+
+```bash
+./keeper zfs-restore --backup FULL_ID DELTA_ID --dataset tank/recovered
+
+# Or restore in separate steps:
+./keeper zfs-restore --backup FULL_ID --dataset tank/recovered
+./keeper zfs-restore --backup DELTA_ID --dataset tank/recovered
+```
+
+ZFS restore verifies every requested backup before receiving it, then reads it
+again for `zfs receive`. Allow for two tape passes. It checks received snapshot
+GUIDs, records the last completed backup in `org.tape-backup:restore`, and blocks
+continuation after an incomplete receive. It never uses `zfs receive -F`, rolls
+back an existing dataset, or overwrites an unrelated destination.
+
+Received filesystems stay **read-only and unmounted**, with sharing disabled.
+This also prevents reads from changing access times and invalidating a later
+incremental receive. Keep that baseline unmodified between restore steps and
+unmount it before the next step. When recovery is complete, mount deliberately:
+
+```bash
+# For an encrypted receive, load its key first when needed:
+# zfs load-key tank/recovered
+zfs set canmount=noauto mountpoint=/srv/recovered tank/recovered
+zfs mount tank/recovered
+# Only when no further incrementals will be applied here:
+# zfs set readonly=off tank/recovered
+```
+
+`inspect` and `verify` support native ZFS backups. `list` is for tar members;
+restore/mount a ZFS dataset to browse its files. An interrupted receive may leave
+an incomplete dataset; use a separate destination to rebuild the full chain.
+Tape-level verification checks framed bytes and completion, while a receive also
+checks the native ZFS stream. See the official
+[send](https://openzfs.github.io/openzfs-docs/man/master/8/zfs-send.8.html) and
+[receive](https://openzfs.github.io/openzfs-docs/man/master/8/zfs-receive.8.html)
+documentation for OpenZFS stream compatibility.
+
+## Back up a remote source over SSH
+
+Run the command on the **machine with the tape drive**. Install the same version
+of `keeper` on the source machine, together with GNU tar. Both machines must
+run Linux; use a binary built for each machine's architecture. Neither machine
+needs Python when using the standalone binary. The tape host also needs the
+OpenSSH client; the source must accept SSH connections.
+
+For example, copy the binary to the source account's home directory:
+
+```bash
+scp ./keeper backup@fileserver:/home/backup/keeper
+ssh backup@fileserver 'chmod +x /home/backup/keeper'
+
+./keeper backup --ssh backup@fileserver \
+  --remote-program /home/backup/keeper \
+  --source /srv/data --level full --device /dev/nst0
+
+./keeper backup --ssh backup@fileserver \
+  --remote-program /home/backup/keeper \
+  --source /srv/data --level incremental --base PREVIOUS_BACKUP_ID \
+  --device /dev/nst0
+```
+
+If `keeper` is in the remote account's PATH, omit `--remote-program`. This
+option is one executable path, not a shell command. `--source` must be an absolute
+path on the remote machine. The SSH account must be able to read all source files
+and metadata; the tool does not run sudo automatically.
+
+Use SSH keys or an agent and establish the server's trusted host key before
+starting. Backups use batch authentication and strict host-key checking, so an
+unknown host or a password prompt fails before tape writing starts. Existing
+OpenSSH configuration, including host aliases and jump hosts, is honored. Options
+`--ssh-port 2222`, `--ssh-identity /path/to/key`, and `--ssh-config /path/to/config`
+override connection settings. Keep the same `--ssh` host/account or alias and
+`--ssh-port` setting throughout an incremental chain; the resolved source path
+must also match.
+
+The remote helper inventories metadata for ETA, runs GNU tar, and streams archive
+chunks over SSH to the local tape writer. Previous and updated incremental
+snapshots stay in RAM on both machines. No archive or state directory is staged
+on either machine. Tape changes pause the stream through pipe backpressure;
+memory use remains bounded by buffers and snapshot metadata rather than archive
+size. Remote file names, errors, transfer rates, and ETA appear in the local
+terminal. SSH transport encrypts the network connection; tapes are not encrypted
+by this tool.
+
+An SSH disconnection or remote tar failure leaves an incomplete tape set that
+cannot be used for restore or as an incremental base. Earlier completed backups
+remain usable for restore, but a partial recorded tail blocks further appends.
+Preserve those cartridges and start a new full on separate media if needed.
+Restore uses the usual local
+`restore` command below and requires no SSH access or original source machine.
+
+## Pipe streaming without a remote binary
+
+Use the release executable or build the current checkout with `./build.sh`
+(or run `python3 keeper.py`).
+
+`stream-backup` accepts any nonempty byte stream: tar archives, `zfs send`, database
+dumps, or another producer. Only the tape host needs `keeper`. The source host
+needs its ordinary producer tools and SSH access. This mode stores the bytes
+without interpreting their contents; `stream-restore` returns those original bytes.
+
+For SSH, prefer a managed producer command. It starts after the first tape is
+ready and its exit status must be zero before the backup gets a completion marker:
+
+```bash
+./dist/keeper stream-backup --name nas-data --buffer-size 1GiB \
+  --command ssh -T -oBatchMode=yes -oStrictHostKeyChecking=yes backup@nas \
+  'tar --acls --xattrs --sparse --numeric-owner -C /data -cf - .'
+```
+
+`--command` must be last; everything following it is the executable and its
+arguments. No local shell is added. For a producer pipeline, explicitly use
+`--command bash -o pipefail -c 'producer | filter'`; a remote pipeline likewise
+needs remote shell pipeline error handling. Keep diagnostics on the producer's
+stderr and only backup data on its stdout.
+
+Existing pipelines can feed stdin directly:
+
+```bash
+set -o pipefail
+ssh -T -oBatchMode=yes -oStrictHostKeyChecking=yes backup@nas \
+  'tar --acls --xattrs --sparse --numeric-owner -C /data -cf - .' \
+  | ./dist/keeper stream-backup --name nas-data --stdin
+```
+
+**Stdin EOF cannot prove that the producer succeeded.** A failed producer can
+leave a checksum-valid backup of only the bytes received. Check the whole
+pipeline's status with `pipefail` and treat that backup as unusable if any stage
+fails. The tape metadata records whether completion used stdin EOF or a checked
+command exit. Use `--command` when the backup itself must reject producer failure.
+
+Add `--estimated-size 12TiB` when you know the approximate number of bytes the
+producer will emit; this enables total ETA and estimated tape counts. Without a
+size, total ETA/count remain unknown while rate and current-tape progress continue.
+`--expected-size` requires an exact positive byte count and rejects shorter or
+longer input; it also supplies the ETA size. Filesystem usage alone is not an exact
+tar or compressed-stream length. `--verify`, `--inventory`, `--label-prefix`,
+`--cartridge-capacity`, and `--media-command` work as for other backups. Tape changes
+apply backpressure to the producer while bounded buffers retain pending data.
+
+Restore to a file, publishing it only after success:
+
+```bash
+./dist/keeper stream-restore --backup ID > recovered.tar.partial && \
+  mv recovered.tar.partial recovered.tar
+```
+
+Or pipe a saved tar stream into its consumer:
+
+```bash
+mkdir -p /srv/recovered
+set -o pipefail
+./dist/keeper stream-restore --backup ID \
+  | tar --extract --acls --xattrs --numeric-owner --file=- --directory=/srv/recovered
+```
+
+Restore stdout contains payload only; interactive progress and fatal errors use stderr,
+and diagnostics go to the log file. Each frame
+is checked before emission, and success requires the final completion marker and
+whole-stream checksum. A later error or missing tape can leave partial output in
+the consumer; check the whole pipeline's exit status, and discard or roll back
+failed output. A separate `verify --backup ID` pass can check all tapes before
+starting a consumer, though output errors can still occur during restore.
+
+Each pipe backup starts on blank media and stands alone in the tape catalog.
+It does not provide automatic tar snapshots, ZFS identity checks, incremental
+appending, chain planning, or built-in file listing. If the producer emits an
+incremental stream, retain its bases and restore order yourself. Use `backup` or
+`zfs-backup` when you want those managed incremental workflows.
+
+## Restore directly from tape
+
+Restore the full backup and incrementals together, or apply the incrementals in
+later commands. They must be applied in parent order.
+
+For a new destination, pass the full ID followed by every incremental ID to the
+desired recovery point:
+
+```bash
+./keeper restore --backup FULL_ID DELTA_1_ID DELTA_2_ID \
+  --destination /srv/recovered --device /dev/nst0
+```
+
+For a full-only restore, specify just the full ID. Tape headers contain the
+metadata required for restore; the original machine, source directory, external
+catalogs, and local incremental snapshots are unnecessary.
+
+To restore one step at a time, use the same destination for each command:
+
+```bash
+./keeper restore --backup FULL_ID --destination /srv/recovered
+./keeper restore --backup DELTA_1_ID --destination /srv/recovered
+./keeper restore --backup DELTA_2_ID --destination /srv/recovered
+```
+
+You can also apply several remaining incrementals in one command:
+
+```bash
+./keeper restore --backup DELTA_1_ID DELTA_2_ID --destination /srv/recovered
+```
+
+Each successful restore records its latest backup ID in a small sibling file,
+such as `/srv/.recovered.tape-restore.json`. It binds the backup's source identity
+to that destination directory. This lets later commands reject skipped,
+repeated, or unrelated incrementals. The file is outside the restored tree, so
+tar's directory deletion records cannot remove it. It is local restore history,
+not a backup catalog required to recover from the tapes.
+
+**For a directory restored by an older executable**, supply the last backup ID
+already applied there once:
+
+```bash
+./keeper restore --backup NEXT_DELTA_ID --base LAST_RESTORED_ID \
+  --destination /srv/recovered
+```
+
+This asserts the existing directory's baseline. The application reads that
+backup's header and validates the next incremental's parent/source; it does not
+re-extract the full backup or compare all existing file contents. Subsequent
+commands use the recorded history and need no `--base`. An untracked nonempty
+directory is otherwise refused. Do not edit the restored tree between steps.
+
+The reader locates each requested backup by ID, including later backups on a
+shared cartridge. It reuses the loaded cartridge when it contains the next
+requested segment, and prompts when another cartridge is needed. Keep every
+cartridge in the chain, including any tapes where an incremental started before
+continuing on another tape.
+
+Restore validates each in-memory chunk before passing its archive bytes to GNU
+tar. It applies additions, changes, deletions, and renames from the ordered chain.
+A **new restore** requires an empty or absent destination. Files are extracted
+into a private sibling directory and published only after the requested chain
+has been verified. Its successful result can then receive further incrementals.
+
+For an **existing restore**, requested incrementals are first read and verified
+without changing files, then read again to apply in place. The full archive is
+not read again, and no second copy of the directory or disk archive is created.
+Each applied incremental is flushed and recorded separately. Files can be
+changed or deleted according to the incremental archive.
+
+An interrupted apply, extraction failure, or disk error can leave the existing
+tree partly updated. Its history is marked incomplete before any changes begin;
+later incrementals are refused until you rebuild the full chain into a separate
+directory. `--base` cannot override an incomplete restore record. The preflight
+verification catches existing tape corruption before changes, but is not a
+rollback mechanism for failures during application.
+
+The tape contains format-3 framing around the tar data, so a direct
+`tar --extract --file=/dev/nst0` cannot restore it. If the standalone executable
+is unavailable, run this repository's `keeper.py` with Python 3.11+, GNU tar,
+and `mt` installed:
+
+```bash
+python3 keeper.py restore --backup FULL_ID DELTA_1_ID DELTA_2_ID \
+  --destination /srv/recovered --device /dev/nst0
+```
+
+For a full-only restore, pass just the full backup ID. Keep a copy of the source
+script or executable with your recovery tools.
+
+**Restore writes extracted files and a small restore-history record, not a
+reassembled tar archive.** For a new restore, allow
+space for the largest intermediate directory tree in the chain, including files
+later deleted by an incremental. Publication uses a rename, without copying the
+restored tree. Permissions, timestamps, links, sparse files, ACLs, and extended
+attributes are restored where supported; arbitrary ownership and privileged
+metadata generally require root. Restore only trusted tape sets, especially as
+root. Checksums detect corruption but are not signatures or encryption.
+
+## Progress, transfer rates, and ETA
+
+`backup` and `zfs-backup` accept `--json` for a completion summary with
+`archive_complete`, `metadata_complete`, `append_ready`, `data_verified`, and
+`warnings`. Tar backups also report `filename_index`, which is true when the
+completed metadata includes their filename index. A metadata failure can leave
+a committed archive whose tail cannot
+be appended to; `append_ready: null` reports that uncertainty. Without `--json`,
+successful backups still print only their ID on stdout. `--verify` performs a
+full read-back after backup; only successful verification sets `data_verified`
+true. Verification failures return nonzero and identify the committed backup.
+With `--verify`, writing occupies the first half of total progress and read-back
+the second half, using the actual committed archive size. The drive lock is held
+through both passes. The display reaches 100% only after verification succeeds;
+failed or interrupted read-back does not undo the committed backup.
+
+Progress refreshes in place every second, like `watch`, instead of adding blocks
+to the terminal's scrollback. The dashboard uses an alternate screen, restores
+the normal screen for tape-change prompts, and leaves a final status when it
+exits or is interrupted. Terminals show overall progress and ETAs first, followed by
+aligned transfer counters, rates, and buffer details. Cyan highlights active
+progress, yellow marks waiting and finalization, and green marks successful
+completion. Timing diagnostics are dimmed. Each block wraps to the available
+width, for example (colors omitted here):
+
+```text
+Backup 726246ca4cb4
+  Status     writing volume 1, chunk 382644
+  Total [################----------------] ~50.0% (backup, estimated)
+  Total job ETA ~02:39:27
+  Tape ETA ~01:43:10
+  Tape 1 of ~2 | 1,518.05 GiB / ~2,500.00 GiB (configured capacity)
+  ETA ~02:39:27 (current archive)
+  Elapsed    02:39:30
+
+  Read       1,495.66 GiB
+  Delivered  1,494.70 GiB  |  Committed 1,494.25 GiB
+  I/O        188.5 MiB/s  |  Average 159.9 MiB/s
+  Source     176.0 MiB/s (reading)
+  Buffer     1.00 GiB each  |  Queued 989.10 MiB  |  Recovery 479.40 MiB
+  Wait totals: source 0.0s | flush 0.0s (0 recovery-buffer flushes) | position 0.0s
+```
+
+Color is automatic on interactive stderr. Set `NO_COLOR=1` (or any nonempty
+value) to disable it, for example `NO_COLOR=1 keeper backup --source /opt`.
+`NO_COLOR` disables color while retaining the in-place refresh. `TERM=dumb`
+disables both color and cursor controls, using plain periodic status instead.
+Backup IDs, JSON results,
+file listings, and restored byte streams on stdout are not colored.
+Help and command menus also use color on interactive stdout, with the same
+environment settings in both the source script and standalone executable.
+
+The progress heading abbreviates the ID; the startup message and successful
+backup result retain the full ID. Transfer counters use at most GiB so ordinary
+progress remains visible on multi-terabyte archives.
+During the final tape commit and metadata write, ETA
+shows `finalizing` until the command actually completes.
+
+Each command prints its log path at startup. Routine messages, file names, child
+process diagnostics, and progress snapshots (every five seconds and at completion)
+are written there. Logs default to
+`~/.local/state/keeper/logs/`, or `$XDG_STATE_HOME/keeper/logs/` when set.
+Each run gets a separate private file. Use `--log-file PATH` before or after the
+command to append to a chosen file, for example:
+
+```bash
+./keeper backup --source /opt/audiobooks --log-file ~/audiobooks-backup.log
+tail -f ~/audiobooks-backup.log
+```
+
+Fatal errors and tape prompts remain visible. With stderr redirected, routine
+progress goes only to the log file; stderr contains the log path and fatal errors.
+Log files contain diagnostics, not archive data, and are not needed for restoration.
+
+The total bar spans **all cartridges** and, for restore, all backup IDs requested
+in that command. Backup percentages use the source inventory estimate and count
+unique payload delivered, so replayed data does not advance the bar twice.
+A fresh tar restore uses the estimate in each archive header; multiple archives
+receive equal shares of the bar, labeled `estimated by archive`. This avoids
+extra tape scans just to obtain a progress denominator. A large full archive and
+a small incremental can therefore take different amounts of time for equal
+portions of that estimated bar.
+
+In-place incremental restores and native ZFS restores already verify before
+applying data. Their total bar includes verification as the first half and
+application as the second half. Verification estimates progress by archive;
+application uses the exact verified archive sizes. Unknown sizes are shown as
+unknown. The display reserves **100% for successful completion**, including
+final flushing and restore history updates; reaching an estimate is not success.
+Progress stays silent during cartridge and wipe-confirmation prompts.
+Standalone `verify` also shows a total bar and calculates ETA from verified
+archive payload bytes. Its initial size comes from the archive header estimate;
+reading snapshot metadata or replayed frames does not advance payload progress.
+
+Backup status shows the configured buffer budget, queued payload bytes, recovery
+bytes retained (including framing), and archive bytes confirmed on media. Each of
+the read-ahead and recovery buffers has that budget; `--volume-size` can reduce
+the recovery budget. The active writer frame and partly filled reader frame are
+not included in the queued count.
+
+During backup, bytes read update after each source read of up to 1 MiB, including
+partially filled chunks. Source MiB/s measures archive bytes received from GNU tar
+or SSH over the reporting interval; it excludes SSH framing and snapshot metadata.
+The reader reports `reading`, `waiting (buffers full)`, or `finished` separately
+from the writer's phase. `waiting for source` means the writer needs another
+small frame; `flushing` identifies a volume boundary, backup completion, or a full
+recovery buffer awaiting confirmation. A zero tape I/O rate alone does not
+indicate whether source reads are still progressing.
+
+I/O rates measure bytes passed to/from the device, including framing, padding,
+and retries. They are host-side rates, not measurements of physical tape motion
+or compressed media capacity. Delivered backup bytes have been accepted by the
+writer; they may still be buffered in the drive. Committed bytes have been
+confirmed on tape by READ POSITION or a synchronous filemark flush. Replay does
+not double-count either logical counter. Restore delivery counts archive bytes
+passed to GNU tar. The average includes elapsed media-change time.
+
+The **current archive ETA** covers the backup currently being written or restored.
+The **total job ETA** includes all selected archives and any verification pass.
+For a restore chain, existing inventory entries supply sizes without extra tape
+scans; verification supplies exact sizes as it finishes. If later archive sizes
+are unavailable, total job ETA says `calculating (remaining archive sizes unknown)`
+while the current archive and tape estimates remain available. Load, rewind,
+eject, and tape-change waits are excluded from ETA throughput calculations; elapsed
+time and average I/O rate still include them. Future operator delays are unknown.
+
+**Tape N of ~M** estimates the number of cartridges for the current backup archive,
+including its current tape. **Tape ETA** estimates time until that tape's remaining
+archive data is transferred, capped at the archive's remaining estimated size for
+a partially filled final tape. A restore chain also shows **Job tapes**, deduplicating
+known shared cartridges; unidentified cartridges may still overlap, so estimates
+can be high. Verification rereads reuse the same cartridges, not a second set.
+
+Capacity comes from `--volume-size` when testing a backup, an optional
+`--cartridge-capacity`, a previously observed full cartridge, or the drive's native
+capacity when supported. Detection reads capacity attributes once when opening
+a volume; it sends no movement commands or periodic capacity queries during writing.
+Unsupported or unavailable capacity stays unknown until a full tape is observed,
+or you supply an estimate. The detected native capacities assume no compression;
+the first full cartridge improves the estimate for later cartridges. Appending
+accounts for existing recorded bytes and, when available, remaining native capacity.
+Compression, framing, replay, varying cartridges, and metadata affect accuracy.
+Restore also reuses the measured volume lengths from its verification pass.
+
+Supply usable **host-data capacity** for a better initial estimate if needed:
+
+```bash
+./keeper backup --source /opt/books --cartridge-capacity 2300GiB
+./keeper restore --backup FULL_ID --destination /srv/books \
+  --cartridge-capacity 2300GiB
+```
+
+This option is advisory: it does not force a tape change or limit writes.
+`zfs-backup` and `zfs-restore` accept it too. Estimates start as `calculating` and
+show `finishing (estimate reached)` if the estimate is exhausted before completion.
+Source estimates use metadata only; source contents are not read just to estimate.
+Sparse files, incremental selection, directory changes, and final flushing can
+affect accuracy. Completion still requires all checks and finalization to succeed.
+
+For uneven write speeds, compare the queue and the cumulative **Wait totals**:
+
+- A drained queue and rising `source` wait indicate that tar, source storage, SSH,
+  or source-side work is not supplying data fast enough.
+- Rising `flush` time and `recovery-buffer flushes` indicate time spent committing
+  data because the recovery window filled. Flush time also includes required
+  header, completion, and catalog commits.
+- Rising `position` time measures the cost of durability queries between writes.
+  Routine queries occur every 64 MiB of records, with another check whenever the
+  recovery window is about to fill.
+- A full queue with little source/flush/query waiting points to write calls,
+  hashing, or the drive/transport, rather than insufficient read-ahead.
+
+At 160 MiB/s, a filled 1 GiB source buffer can bridge about 6 seconds without new
+input; 4 GiB can bridge about 26 seconds. `--buffer-size 4GiB` can help a bursty
+source, but allocates up to 4 GiB each for read-ahead and recovery, plus overhead.
+It cannot improve a sustained source deficit or a drive-limited transfer when the
+queue is already full. `--quiet` removes per-file log traffic while keeping these
+diagnostics. The counters diagnose pauses; no throughput increase is guaranteed.
+
+`--quiet` suppresses per-file entries in the log while retaining rates, ETA,
+summaries, and errors. Large-file transfers still refresh the dashboard.
+While waiting for a tape-change response or loader command, progress ticks pause
+and file names/diagnostics from local tar and SSH wait behind the prompt. Logging
+resumes after Enter is pressed or the loader returns. Child output uses bounded
+pipes, so waiting does not accumulate an unbounded log in RAM or on disk.
+
+## Bounded buffering and failure recovery
+
+The default buffer budget is 1 GiB; adjust it with `--buffer-size`, between 64 KiB
+and 10 GiB. For example:
+
+```bash
+./keeper backup --source /opt --level full --buffer-size 10GiB
+```
+
+The background reader feeds a bounded queue of small frames (normally 4 MiB),
+while the writer drains it continuously. Writing starts with the first frame;
+it does not wait for the entire buffer budget to fill. Free queue slots are
+refilled individually during writes and tape changes. Whole-archive checksums
+are updated incrementally; individual frames also carry checksums and chain links.
+
+There is no synchronous filemark after every frame. On supported physical drives,
+SCSI READ POSITION reports which records have reached the medium without flushing
+the drive. Only complete frames below that position are released from the recovery
+buffer. The accepted-write position is checked against our record count, and the
+medium position must never move backwards. Kernel asynchronous writes are disabled
+to keep these counts aligned; the drive buffering setting is preserved.
+
+The writer commits at volume boundaries and backup completion. It also commits if
+the recovery buffer fills before the drive confirms enough data. This fallback is
+necessary when position reporting is unsupported, unavailable, inconsistent, or
+the buffer is too small for the drive's unconfirmed tail. Linux SG_IO access may
+require root/CAP_SYS_RAWIO. The startup log reports unavailable position tracking;
+status identifies fallback flushes as `recovery buffer full`. File-backed media
+uses the same fallback with fsync instead of hardware position reports. A source
+that cannot keep up, media changes, and drive behavior can still cause pauses.
+
+The source queue and recovery window each use up to the selected budget, plus a
+few active frames, allocation overhead, Python/GNU tar memory, incremental
+snapshot metadata, and the filename catalog. The current filename listing is
+capped at 16 MiB; the serialized catalog is capped at 64 MiB, with additional
+memory needed while encoding it. Allow more than 2 GiB of RAM at the default, or more than 20 GiB
+with a 10 GiB budget. Very small budgets still allow one active frame and one queued
+frame, and at least 128 KiB of recovery framing. Allocation grows on demand.
+The SSH source only needs small transport frames and its snapshot metadata.
+Restore holds a small frame plus a bounded history of header digests.
+
+On a short write, end-of-tape indication, or write/position I/O error, the writer
+requests another tape and replays **every unconfirmed frame**, including the
+partially written frame. Keep earlier volumes: they contain the confirmed prefix
+and may also contain some or all of the replayed tail. Restore validates the chain
+and each replayed header before suppressing duplicates, so several overlapping
+frames across replacement volumes are safe. Repeated failures without confirmed
+progress stop the job.
+
+A final completion marker is written only after GNU tar exits successfully and
+the new incremental snapshot has been recorded. Backup reports success only after
+the final synchronous commit. Missing frames, wrong tapes, checksum failures, and
+incomplete sets are rejected. Use `--verify` during backup or a separate `verify` command for a full read-back pass.
+
+Tar backups use **format 3**; native ZFS backups use **format 4** volume headers
+with the same bounded frame/replay machinery. Update both ends of SSH backups
+together; the current transport uses 64-bit version-3 packet framing.
+
+See the [continuous-streaming design and validation plan](continuous-streaming.md).
+
+**A stopped/killed process or power failure can leave an incomplete tail that
+blocks further appends.** There is no persistent byte-resume checkpoint or automatic
+tail repair. Preserve completed backups for restore; start a new full backup on
+separate media when the chain cannot be continued. For an interrupted new restore, restart the requested chain. Rebuild an interrupted
+in-place restore into a separate destination. Ordinary failures clean up the private
+tree for a new restore; an interrupted in-place apply is marked incomplete.
+After SIGKILL or power loss, an abandoned `.DEST.restoring-*` sibling
+may remain and can be removed after confirming it belongs to that failed restore.
+
+The executable itself extracts its bundled runtime into a temporary directory;
+this is a small runtime footprint, not backup staging. A few fixed-size lock files
+are also used. `TMPDIR` must support executable mappings and symlinks when running
+the standalone executable.
+
+## List files
+
+```bash
+# Load the final cartridge for an indexed listing; no backup ID required
+# when listing the first backup represented on that cartridge.
+./keeper list --device /dev/nst0
+
+# List a particular full or incremental backup on a shared cartridge.
+./keeper list --backup BACKUP_ID --device /dev/nst0
+
+# Require an index; never fall back to a lengthy archive scan.
+./keeper list --backup BACKUP_ID --index-only
+
+# Read every volume and verify the archive while listing, starting at volume 1.
+./keeper list --backup BACKUP_ID --scan
+
+# Save the names; progress and tape prompts stay separate.
+./keeper list --backup BACKUP_ID > files.txt
+```
+
+`list` prints archived file and directory names without extracting anything.
+New tar backups automatically collect the names from the actual archive stream,
+including local and SSH backups, quiet backups, exclusions, and incremental
+changes. The index is stored in the checksummed catalog on the backup's **final
+cartridge**. An indexed listing needs only that cartridge; it reads metadata and
+checks the selected backup header without reading the file payloads. The drive
+still needs time to seek to the catalog. No local inventory or source access is
+required, and the fast listing does not require GNU tar at read time.
+
+Indexed listings validate the metadata, **not the archived file contents**.
+The dashboard and log identify this distinction. Use `verify` or `list --scan`
+for a complete read-back and archive checksum validation.
+
+If no usable index is available, plain `list` falls back to scanning the entire
+selected backup and requests its tapes in order, beginning with volume 1.
+Use `--index-only` to fail without scanning instead. Existing tapes are unchanged
+and retain this scan-based listing. An index may be unavailable if its escaped
+text exceeds 16 MiB, the catalog cannot fit it, or metadata writing failed.
+Optional indexes are dropped as needed to preserve room for catalog locations
+and the incremental snapshot. A missing or damaged index does not prevent a
+normal archive scan or restore. Plain `tar -tf /dev/nst0` cannot decode this
+framed tape format.
+
+Names go to stdout, with special characters such as embedded newlines escaped
+by GNU tar. Diagnostics go to the log file; an interactive dashboard is used
+when the listing is redirected. Output may be partial if the
+command is interrupted, a cartridge is missing, or validation fails; only exit
+status 0 indicates a completed listing. All output pauses during tape prompts.
+The tape remains loaded.
+
+Each invocation lists one archive. For an incremental, this shows archived
+changes and directory entries, not the complete reconstructed filesystem or a
+separate list of deletions. Use `inspect` to find backup IDs on a shared cartridge.
+
+## Inspect and verify
+
+```bash
+# List every backup segment on the loaded cartridge, including incrementals.
+./keeper inspect --device /dev/nst0
+
+# Quickly read just the first backup header (the previous default).
+./keeper inspect --first --device /dev/nst0
+
+# Inspect a particular backup's first volume, possibly later on the same tape.
+./keeper inspect --backup BACKUP_ID --device /dev/nst0
+
+# info is an alias for inspect. Force a format when needed.
+./keeper info --first --text
+./keeper inspect --json > cartridge.json
+
+# Read and verify every data chunk and the whole archive's checksum.
+./keeper verify --backup BACKUP_ID --device /dev/nst0
+```
+
+If `backup --verify` reports that the backup **was committed**, but read-back
+verification failed, retain its cartridges and retry just `verify` with the
+reported backup ID. A fresh `verify` run asks for volume 1 and rewinds before
+reading it. There is no need to erase the tape or repeat the backup to retry
+verification. The archive remains unverified until a complete read-back succeeds.
+
+When reusing a loaded cartridge, an EIO during the initial lookup is logged and
+retried once from the beginning of tape. Errors after that rewind or while
+reading the selected archive still fail verification. For persistent errors,
+retain the per-run log and check the host's kernel log for tape/SCSI diagnostics.
+
+In a terminal, `inspect` (also `info`) and `verify` show labeled, wrapped details
+with complete IDs and an explicit data-verification state. `--json` selects
+structured output; redirected stdout defaults to JSON to preserve scripts.
+`--text` forces readable output even through a pipe. Partial listings still
+return exit code 1 and show the entries found plus the failure reason.
+
+The JSON output from plain `inspect` lists the full backup and appended incrementals in its `backups`
+array. `--all` remains an optional alias for this default. Each entry includes its
+ID, source, creation time, full/incremental level, parent ID, and volume number.
+It lists segments on the loaded cartridge, including continuation segments;
+it does not request other cartridges. With `--media-dir`, it lists all cartridge
+files.
+
+When the cartridge ends with a valid metadata catalog, inspection reads that
+metadata and seeks directly to each indexed backup header. It validates the
+catalog and header checksums without reading archive data. Entries report
+`listing_method: "catalog"`; `completion_marker_present` is `null` because the
+archive's completion record was not read. Loading, tape positioning, and metadata
+reads still take time.
+
+If the catalog is absent, incomplete, or unusable, physical-tape inspection reports
+that a scan is required and exits nonzero. Run `inspect --scan` to permit the
+sequential fallback, which can take substantially longer. File-backed media
+retains automatic scanning. Entries report `listing_method: "scan"` and whether a completion marker was
+encountered. An unreadable or partial tail is reported in `errors` with
+`scan_complete: false`, while earlier headers remain listed. `scan_complete: true`
+means listing finished without errors, whether by catalog lookup or scanning.
+Incomplete inspection retains discovered entries in JSON and returns exit code 1.
+Catalog lookup validates each indexed header once, avoids redundant positioning,
+and hashes unneeded snapshot data without allocating another full RAM copy.
+
+`inspect --first` reads only the first 64 KiB header from a backup's first
+cartridge, preserving the previous quick ID-discovery behavior. It returns a
+single object with `volume: 1` and `header_verified: true`, without reading the
+archive or incremental snapshot.
+
+All inspection modes leave `data_verified` and `completion_verified` false.
+Readable headers, catalogs, and completion markers do not establish that an
+entire backup is restorable. `verify` reads all volumes without extracting files
+and reports `data_verified: true` only after validating the full stream and
+completion record. Final archive sizes, checksums, and total volume counts come
+from `verify`.
+
+Selecting `--backup ID` can use the final catalog to seek to that backup's header.
+When a complete current catalog rules out the requested ID or volume, the reader
+rejects the cartridge without scanning archive payload. Without a usable complete
+catalog it can scan preceding records. Use `verify --backup ID`
+to validate the selected backup's full stream, rather than every backup on the
+cartridge. For a recovery chain, verify each backup separately.
+
+## Tape format
+
+Tar backups use format 3 (`TAPE-STREAM-3`), including existing legacy format-3 backups.
+Native ZFS uses format 4 (`TAPE-STREAM-4`) volume headers, so old readers reject
+it before interpreting native payloads as tar. Opaque pipe backups use format 5
+(`TAPE-STREAM-5`) with no incremental snapshot; older releases reject these tapes.
+Formats 1 and 2 remain unsupported.
+
+Appended backups are separately framed streams using the format of their archive type. The additional metadata file
+has its own version (currently 1); existing archive headers are never rewritten.
+Use the current executable or source for selecting appended backups; the older
+legacy reader does not implement cartridge catalog lookup.
+
+See the [append design and validation notes](append-incrementals.md).
+
+## Preview a backup without writing tape
+
+```bash
+./keeper backup --source /opt --dry-run --exclude cache \
+  --cartridge-capacity 2500GiB
+./keeper backup --source /opt --level incremental --base PREVIOUS_ID \
+  --dry-run --json
+./keeper zfs-backup --snapshot tank/books@next --base PREVIOUS_ID --dry-run
+```
+
+Previews validate the source and options, inherit the parent's exclusion policy,
+and estimate archive size without starting tar creation or a ZFS send stream.
+Local and SSH sources are supported. A full preview needs no tape drive; an
+incremental preview reads the parent's first header from tape under the drive
+lock. Native ZFS uses `zfs send` in estimate-only mode and validates snapshot GUIDs.
+
+The preview does **not** check blank media, remaining physical capacity, or the
+final append position. It is not an exact changed-file list. Actual backups repeat
+source and tape validation. `--cartridge-capacity` supplies an advisory capacity for
+both previews and live tape-count/ETA estimates,
+not a write limit; the hidden `--volume-size` remains the testing write limit.
+The cartridge estimate assumes empty cartridges and no hardware compression.
+Framing, recovery, metadata, and existing contents change the actual count.
+
+## Cartridge labels and optional inventory
+
+```bash
+./keeper backup --source /opt --label-prefix BOOKS-202609 \
+  --inventory /root/tapes.json
+./keeper backup --source /opt --level incremental --base PREVIOUS_ID \
+  --inventory /root/tapes.json
+```
+
+New cartridges receive a random recording ID and a readable label in their volume
+headers. The example labels new cartridges `BOOKS-202609-001`, `BOOKS-202609-002`,
+and so on. Without a prefix, labels use `TAPE-` plus part of the random ID.
+The prefix counter restarts for each command; use a distinct prefix for a new set.
+The recording ID distinguishes tapes even if readable labels are duplicated.
+These are ordinary tape records, not MAM or hardware serial numbers. Wiping and
+reusing a cartridge starts a new recording identity. Labels are not changed in place.
+
+Appending preserves the cartridge's existing identity and label, even when a
+different prefix was supplied. New continuation cartridges receive new identities.
+Older tapes remain readable and appendable; their unlabeled identity is derived
+from the first recorded header. Physically label cartridges using the printed
+label, and retain the full ID and volume numbers when needed for recovery.
+
+`--inventory FILE` on backup creates or atomically updates an optional JSON file
+after the archive is committed. It records all volumes written by the command,
+including earlier cartridges without final catalogs. It also survives a later
+verification failure. An inventory write failure produces a warning and
+`inventory_updated: false` in the backup JSON; the completed tape archive remains
+usable. No inventory is written by a preview.
+
+Rebuild or extend an inventory from existing tapes:
+
+```bash
+# Repeat with each cartridge inserted. No archive scan is performed by default.
+./keeper inventory --output /root/tapes.json
+
+# Explicit fallback when metadata is insufficient; this can take hours.
+./keeper inventory --output /root/tapes.json --scan
+```
+
+Without a usable final catalog, the default command collects only the first
+header and returns **2** to indicate incomplete cartridge coverage. An earlier
+cartridge can hold additional segments that require `--scan` to discover.
+Successful observations are retained even if another part of the cartridge
+cannot be read. Simulated `--media-dir` inventories cover all files in that directory.
+
+The inventory is limited to 64 MiB and 100,000 segment observations. It is a cache
+of observations, not proof that tapes are still available or verified. Rescanning
+merges observations; it does not automatically delete records for erased or lost
+tapes. Start a new inventory file when rebuilding from only the tapes you retain.
+Conflicting backup identities are refused. Reads can use `--inventory FILE` to
+show label hints at cartridge prompts, but still validate actual tape contents.
+The loader's four arguments are unchanged.
+
+Deleting this file does not affect explicit-ID backup, verify, or restore. Tape
+metadata remains the recovery source of truth; the inventory never authorizes
+overwriting or appending.
+
+## Plan and discover a restore chain
+
+```bash
+# Offline planning from an inventory; no destination or tape drive is needed.
+./keeper restore --to LATEST_BACKUP_ID --plan --inventory /root/tapes.json
+
+# Apply the discovered full chain into a new destination.
+./keeper restore --to LATEST_BACKUP_ID --inventory /root/tapes.json \
+  --destination /srv/recovered
+
+# Native ZFS supports the same planning/discovery options.
+./keeper zfs-restore --to LATEST_BACKUP_ID --plan --inventory /root/tapes.json
+./keeper zfs-restore --to LATEST_BACKUP_ID --inventory /root/tapes.json \
+  --dataset tank/recovered
+```
+
+Without `--inventory`, planning reads catalog/header information from the loaded
+cartridge (all cartridge files for `--media-dir`), without a payload scan. It
+shows the full-to-incremental order, cartridge labels and recording IDs, missing
+backup observations, missing volumes, and unknown final volume counts. Complete
+ancestor metadata can identify missing intermediate backups; older headers are
+followed through their parent IDs as far as the available observations permit.
+
+`--plan` accepts `--text` or `--json` and returns **0** for a complete metadata plan,
+**2** for missing information, and **1** for invalid/conflicting information.
+It does not verify archive data or establish that every listed cartridge is
+physically available. `--to` without `--plan` refuses an incomplete plan and uses
+the existing restore validation to check every actual stream before claiming
+success. A stale or edited inventory cannot bypass tape identity/chain checks.
+`--to` selects a full chain for a new destination; explicit `--backup ID...`
+remains available for stepwise restores and recovery without an inventory.
+
+```mermaid
+flowchart LR
+    A[Completed backups or tape metadata] --> B[Optional inventory]
+    B --> C[Choose recovery point]
+    C --> D[Check parent chain and volume observations]
+    D -->|Missing information| E[Collect additional cartridge metadata]
+    E --> B
+    D -->|Plan complete| F[Load tapes and validate actual streams]
+    F --> G[Restore full then incrementals]
+```
+
+## Automated tape loading
+
+`--media-command /absolute/path/to/loader` runs an executable with four arguments:
+
+```text
+write|read|append|blank  BACKUP_ID  VOLUME_NUMBER  DEVICE
+```
+
+The loader must load the requested cartridge, wait for readiness, and return zero.
+Keeper uses `blank` for the first cartridge of a new full and every empty
+continuation cartridge, including when an
+incremental cannot start under the configured size cap. The application checks
+that no recorded data exists before writing. The loader must supply blank media
+and must not erase a recorded cartridge to satisfy this request.
+If the cartridge contains recorded data, the application closes it and repeats
+the same `blank ID NUMBER DEVICE` request, retaining its buffers and source stream.
+The loader should wait for a suitable cartridge or return a nonzero status to
+cancel, rather than repeatedly returning the rejected tape.
+Read requests also repeat when a readable cartridge does not contain the required
+backup/volume. Accepted read progress is retained. Corrupt or unreadable media
+still produces an error instead of silently retrying forever.
+For `append`, load the
+base backup's final cartridge and preserve its contents; the ID is the base ID
+and the volume-number argument is `0` because its final volume is not yet known.
+For ID discovery, the ID argument is `unknown-backup`. Plain `inspect` and `inspect --all` use
+`read unknown-backup 0 DEVICE` to request a cartridge independently of a backup's
+volume number. Indexed listing with `list --backup ID` uses `read ID 0 DEVICE`:
+load that backup's final cartridge. Without an ID, `list` also uses
+`read unknown-backup 0 DEVICE`. `list --scan` requests volume 1 and subsequent
+volumes normally. Update existing loaders to support these requests.
+The command runs without a shell; prompts otherwise
+use `/dev/tty`. The application closes the tape device before requesting another
+cartridge. During backup, it also rewinds and ejects a full tape before invoking
+the loader for the next cartridge, including at a configured size limit. If eject
+fails, it logs the error and still invokes the loader. The loader must handle any
+remaining unloading needed to change tapes, including read requests and retries
+after a recorded continuation cartridge is refused.
+
+## Initialize a tape for reuse
+
+Load the cartridge you intend to erase, then run:
+
+```bash
+./keeper wipe --device /dev/nst0
+```
+
+**This destroys access to the existing backups on the loaded tape.** The command
+names the device and requires typing `WIPE` before it changes the tape. For
+unattended use, supply `--yes` to explicitly confirm the destructive operation:
+
+```bash
+./keeper wipe --device /dev/nst0 --yes
+```
+
+The default is short erase, intended to initialize the tape for reuse. It is
+not a secure sanitization guarantee. Use `--long` to request a long erase, which
+can take hours and may keep running in the drive after an interruption:
+
+```bash
+./keeper wipe --device /dev/nst0 --long
+```
+
+The implementation uses Linux's [short/long erase interface](https://www.kernel.org/doc/html/latest/scsi/st.html#ioctls).
+It waits for the erase command, checks the result with the same blank-tape check
+used by continuation backups, and leaves the tape rewound and loaded. It writes
+no backup header or filemark. A failed erase or uncertain blank state is reported
+as an error, not successful initialization. No automatic fallback to long erase
+is performed. This operates on the drive's current tape partition; it does not
+repartition media or certify erasure of other partitions or cartridge memory.
+
+You can also initialize an unrelated used cartridge **while a backup is waiting**:
+
+```text
+Press Enter when ready, or type wipe to short-erase the loaded tape, eject to unload, or q to stop: wipe
+...
+Type WIPE to confirm, or anything else to return to the tape prompt: WIPE
+Short erase in progress; backup buffers are retained...
+Blank tape verified; continuing backup on this cartridge.
+```
+
+This is available at the initial blank-tape prompt and continuation prompts for
+tar and native ZFS backups. It always requests a short erase, verifies the blank
+state, and continues on the same volume number. Canceling the erase returns to
+the load prompt without ending the backup. Refused or failed erases also return
+to that prompt, preserving pending data. The next write still requires a
+successful blank check.
+
+The prompt refuses tapes whose first header identifies the active backup or any
+recorded ancestor, and remembers first-header fingerprints of cartridges already written or
+selected for appending during this job. It rechecks the loaded header after the
+confirmation. Unreadable or corrupt recognized headers are normally refused.
+At the **first cartridge of a new full backup**, before any cartridge has been
+written and with no ancestors to protect, an I/O error reading the old contents
+does not prevent an explicitly confirmed wipe. The prompt warns that cartridge
+identity cannot be checked and still requires `WIPE`; the erase and subsequent
+blank verification must succeed. This matches standalone wipe's ability to erase
+unreadable old contents. Continuations and incremental backups retain the read
+requirement. Check the
+physical tape label before confirming: unrelated backups on a reused cartridge
+will be lost. Read/restore and append-selection prompts never offer an erase.
+Automated media loaders still must supply blank media; this feature requires
+interactive confirmation.
+
+New backups record ancestor IDs in their volume headers and catalog summaries,
+so protection survives restarting the application. Older full backups can start
+a chain with complete ancestry. Older incrementals may not record every ancestor;
+they remain readable and appendable, but in-prompt wiping of recorded cartridges
+is refused when the chain is incomplete. Supply a blank spare in that case, or
+initialize spares with the standalone `wipe` command before starting the job.
+The list is bounded to 512 ancestors; exceeding it retains append/restore support
+and marks the ancestry incomplete rather than silently dropping wipe protection.
+Starting a new full backup starts a new complete list. These are optional metadata
+fields; the tape formats and existing restore compatibility are unchanged.
+
+The active backup performs this erase under its existing drive lock. A separate
+`keeper wipe` process still refuses to run while a backup/restore holds the
+lock. Type `eject` at the load prompt to unlock and unload the drive without ending
+the operation, or use the drive's eject button. This feature does
+not provide resume support for an already exited backup, and replacing the
+executable cannot add it to a process that is already running.
+
+## Drive status and diagnostics
+
+```bash
+./keeper status
+./keeper doctor --device /dev/nst0
+./keeper status --json
+./keeper status --text | less
+```
+
+Both commands show aligned details in a terminal, including identity, readiness,
+write-protection, compression, tape file/block, logical position, driver settings,
+and I/O counters with readable units. Missing information says `Unknown`, rather
+than implying compression is off or the tape is at block zero. `--json` selects
+structured output; redirected stdout defaults to JSON. `--text` forces readable
+output in a pipe. They
+do not rewind, erase, eject, or change settings. Unsupported/unavailable fields
+remain unknown with diagnostics. When another Keeper command owns the shared drive
+lock, only passive sysfs statistics are read. Counters describe host I/O, not
+guaranteed remaining physical capacity.
+
+## Hardware compression
+
+```bash
+./keeper compression status --device /dev/nst0
+./keeper compression on --device /dev/nst0
+./keeper compression off --device /dev/nst0
+```
+
+Omitting the action runs `status`; `/dev/nst0` is the default device. Status reads
+the drive's current Data Compression mode page and reports `ON`, `OFF`, or
+`UNSUPPORTED`. Setting compression uses the same Linux tape-driver operation as
+`mt -f /dev/nst0 compression 1` or `compression 0`, then reads the setting back
+before reporting success. An unreadable setting produces an error rather than
+being reported as `OFF`. Direct SCSI queries may require root/CAP_SYS_RAWIO.
+
+These commands do not rewind, erase, or eject the tape. They use the same drive
+lock as backup/restore, so set compression before starting the job. Status reports
+the drive's compression-enable setting, not the compression ratio achieved for
+the data. This does not add software compression to the archive or rewrite
+existing recordings. Drive configuration may reset the setting after media loads
+or power cycles; the command does not change persistent driver defaults.
+
+## Rewind a tape
+
+Return the loaded tape to the beginning:
+
+```bash
+./keeper rewind --device /dev/nst0
+```
+
+`/dev/nst0` is the default, so `./keeper rewind` also works. The command
+waits for rewind to finish and leaves the cartridge loaded with its recorded
+data intact. It uses the same drive lock as backup/restore and refuses to run
+while another job holds that lock, including at a tape-change prompt.
+
+## Eject a tape
+
+During a multi-tape backup, each full tape is automatically rewound and ejected
+before the next cartridge is requested. This also applies to incremental backups
+and configured cartridge size limits. Buffered data and the drive lock are retained.
+If automatic eject fails, the backup reports the error and continues to the load
+prompt, where you can type `eject` to retry or replace the cartridge manually.
+
+The final tape stays loaded after backup. Tapes also stay loaded after restore,
+list, inspect, and verify, and at their tape-change prompts. When finished, eject explicitly:
+
+```bash
+./keeper eject --device /dev/nst0
+```
+
+This unlocks, rewinds, and unloads the selected drive; `/dev/nst0` is the default. It uses
+the same drive lock as other commands and refuses to run while another job under
+any Unix account holds that lock, including while waiting for a tape change.
+At a tape-change prompt, type `eject` to unlock and unload the current cartridge
+under the active operation's lock. This works during backup, restore, verification,
+inspection, and append selection. The prompt keeps the same requested cartridge
+and preserves buffered data; insert the replacement and press Enter. An unload
+failure returns to the prompt. The physical eject button remains usable when the
+drive allows removal. Every incremental retains the final base cartridge for writing
+unless it needs a blank continuation cartridge. Pressing Enter at a continuation
+prompt cannot authorize overwriting the still-loaded base tape.
+If a recorded tape is inserted, the prompt repeats for the same volume. The
+backup remains active until a blank cartridge is supplied, an unrelated used
+cartridge is explicitly short-erased through the prompt, or the operation is
+cancelled. Once the process exits, replacing the cartridge cannot resume it;
+the required streaming state existed only in RAM.
+
+## Test multiple physical tapes
+
+The optional `--volume-size` argument is hidden from normal `backup --help`.
+It caps each physical cartridge for this backup, without changing the cartridge's
+actual capacity. For example, treat each 2.5 TB cartridge as a 10 GiB volume:
+
+```bash
+./keeper backup --source /path/to/test-data --level full \
+  --device /dev/nst0 --volume-size 10GiB
+```
+
+Use a small test source with about 25 GiB of actual, non-sparse file data to
+exercise roughly three cartridges. The limit applies to each tape, **not to the
+total source**; pointing at a multi-terabyte source still backs up that entire
+source. The first cartridge and all continuation
+cartridges must be blank. Initialize previously used test cartridges with `wipe`
+before starting or through the interactive load prompt. Label them with the
+printed backup ID and volume numbers.
+
+The writer commits and prompts for the next cartridge before exceeding the cap.
+It counts formatted record bytes, including headers and padding, before drive
+compression; filemarks and physical drive overhead are excluded. Existing records
+count toward the cap when appending. The drive's real end-of-medium handling still
+applies if reached sooner. This tests planned tape changes and multi-volume
+restore; it does not reproduce every physical end-of-medium error.
+
+After the backup completes, load volume 1 and verify or restore normally:
+
+```bash
+./keeper verify --backup BACKUP_ID --device /dev/nst0
+./keeper restore --backup BACKUP_ID --destination /root/tape-test-restore \
+  --device /dev/nst0
+```
+
+Verify and restore request each required volume without a capacity option. Omit
+`--volume-size` on later backups to use normal tape capacity. The test option also
+works with SSH sources and incrementals. Sizes accept integer bytes or `KiB`,
+`MiB`, `GiB`, and `TiB`; the minimum is 256 KiB. Use `10000000000` for exactly
+10 decimal GB, or `10GiB` for 10 binary GiB.
+
+## File-backed testing and building
+
+`--media-dir` uses files as simulated cartridges instead of a physical device.
+It cannot be combined with `--device`. Its default volume cap is 1 GiB.
+
+```bash
+full_id=$(./keeper backup --source ./sample-data --media-dir ./demo-tapes \
+  --volume-size 1MiB --buffer-size 256KiB)
+./keeper restore --backup "$full_id" --media-dir ./demo-tapes \
+  --destination ./demo-restored
+
+# After changing files in sample-data, append an incremental.
+delta_id=$(./keeper backup --source ./sample-data --media-dir ./demo-tapes \
+  --level incremental --base "$full_id" --volume-size 1MiB \
+  --buffer-size 256KiB)
+./keeper inspect --media-dir ./demo-tapes
+./keeper restore --backup "$full_id" "$delta_id" --media-dir ./demo-tapes \
+  --destination ./demo-restored-latest
+
+# Build a glibc 2.31 executable using Docker with BuildKit.
+./build.sh
+
+# Or build for the local Linux environment with Python 3.11+, pip 22.3+,
+# the venv module, and binutils. The result inherits host library requirements.
+./build.sh --local
+
+# Test source code, SSH, and the built executable.
+# SSH integration tests need ssh, ssh-keygen, and sshd (openssh-client/server).
+TAPE_BACKUP_BINARY="$PWD/dist/keeper" python3 -m unittest discover -s tests -v
+
+# Native ZFS integration tests require a dedicated, disposable scratch pool.
+# Tests create and remove their own child datasets; never use a production pool.
+sudo env TAPE_BACKUP_ZFS_TEST_POOL=my_scratch_pool \
+  TAPE_BACKUP_BINARY="$PWD/dist/keeper" \
+  python3 -m unittest discover -s tests -p test_zfs.py -v
+
+# Optional 10 GiB streaming round trip (about 31 GiB disk and >20 GiB free RAM).
+TMPDIR="$PWD" TAPE_BACKUP_BINARY="$PWD/dist/keeper" TAPE_BACKUP_LARGE_TEST=1 \
+  python3 -m unittest discover -s tests -p test_binary.py -k full_10_gib -v
+
+# Test in Debian 11 without Python installed.
+docker run --rm --network none \
+  -v "$PWD/dist:/opt/keeper:ro" \
+  -v "$PWD/tests/binary_smoke.sh:/smoke.sh:ro" \
+  debian:bullseye-slim sh /smoke.sh
+```
+
+Build output is `dist/keeper` and `dist/keeper.sha256`; only the executable
+needs to be copied to another compatible system. `PYTHON=/path/to/python3` selects
+the interpreter for `--local` builds. PyInstaller is isolated in `.venv-build`.
+The `TAPE_BACKUP_*` test environment variables retain their names for compatibility
+with existing test scripts.
+
+Tests cover streaming full and multiple incremental restores, no disk staging,
+metadata, ETA/rates, end-of-medium rollover, short writes, synchronous flush
+failures, lost buffered tails, duplicate replay, corruption, incomplete tapes,
+same-cartridge appends, preservation of earlier records, metadata lookup,
+interrupted tails, chain validation, SSH full/delta restores, host-key verification, remote failures,
+connection loss, and standalone binaries at both ends. SSH tests launch a
+temporary loopback server with isolated keys/configuration. Automated tape checks
+use simulated media; qualify end-of-medium recovery and restore on your drive
+and loader with scratch media before relying on them.
+
+The [CI workflow](../.github/workflows/test.yml) builds the executable, runs the
+source/binary/SSH tests and the no-Python smoke test, and exercises native ZFS
+full, incremental, stepwise, and encrypted raw restores on a scratch pool.
+An archived fixture from the original tape-backup application checks compatibility with released tar tapes.
+
+Format 3 uses 64 KiB records with checksummed headers and payload frames up to
+4 MiB. Frames share a tape file between explicit commits. Archive payloads are
+GNU incremental tar streams; the surrounding framing is specific to this tool.
+Use this script to restore these volumes, rather than invoking tar directly on
+the device.
+
+See [GNU tar incremental semantics](https://www.gnu.org/software/tar/manual/html_node/Incremental-Dumps.html)
+and the [Linux SCSI tape driver](https://www.kernel.org/doc/html/latest/scsi/st.html)
+for the underlying archive and tape behavior.
