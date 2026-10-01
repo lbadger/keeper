@@ -42,7 +42,7 @@ ZFS_MAGIC = b"TAPE-STREAM-4\n"
 STREAM_MAGIC = b"TAPE-STREAM-5\n"
 ARCHIVE_FORMATS = {'tar': 3, 'zfs': 4, 'stream': 5}
 ZERO_CHAIN = "0" * 64
-PROGRAM_VERSION = "1.0.0"
+PROGRAM_VERSION = "1.0.1"
 PROGRAM_NAME = 'keeper'
 HELP_BANNER = r""" _  __
 | |/ /___  ___ _ __   ___ _ __
@@ -77,6 +77,10 @@ class BackupError(Exception):
 
 class MediaNotBlank(BackupError):
     """A continuation cartridge was rejected before any records were written."""
+
+
+class TruncatedTapeRecord(BackupError):
+    """A record has the wrong size for a Keeper boundary or cartridge identity."""
 
 
 class WrongMedia(BackupError):
@@ -1177,7 +1181,8 @@ def format_backup_info(result):
                 rows.append(('Expected stream size', readable_size(job['stream']['expected_bytes'])))
         if job.get('excludes'):
             rows.append(('Exclusions', ', '.join(job['excludes'])))
-        rows.append(('Data checksums', 'Verified' if job.get('data_verified') else 'Not verified; run verify'))
+        rows.append(('Data checksums', 'Verified during this operation' if job.get('data_verified')
+                     else 'Not checked during this operation'))
         return detail_rows(title, rows, width)
     if 'backups' not in result:
         return describe(result, 'Verified backup' if result.get('data_verified') else 'Backup metadata')
@@ -1288,7 +1293,7 @@ class Volume:
             if record:
                 self.record_bytes += len(record)
                 if len(record) != BLOCK_SIZE:
-                    raise BackupError("Truncated tape record; cannot locate a safe boundary")
+                    raise TruncatedTapeRecord("Truncated tape record; cannot locate a safe boundary")
                 if self.physical and before == 0:
                     self.first_header_sha256 = hashlib.sha256(record).hexdigest()
                 return record
@@ -1832,15 +1837,18 @@ class TapeMedia:
             unreadable = False
             try:
                 record = volume.next_record()
-            except OSError as exc:
+            except (OSError, TruncatedTapeRecord) as exc:
                 # Only a fresh full backup has no previously written cartridge
                 # or ancestor to protect. Erasing its first tape need not be
-                # able to read the old contents, just as with standalone wipe.
+                # able to read the old contents as Keeper records, just as with
+                # standalone wipe. Boundary scans elsewhere remain strict.
                 fresh_full = (allow_unreadable and
                               getattr(self, 'protected_ancestry_complete', False) is True and
                               getattr(self, 'protected_backup_ids', None) == {backup_id} and
                               getattr(self, 'protected_headers', None) == set())
-                if exc.errno != errno.EIO or not fresh_full:
+                if not fresh_full or (isinstance(exc, OSError) and exc.errno != errno.EIO):
+                    if isinstance(exc, TruncatedTapeRecord):
+                        raise
                     raise OSError(exc.errno, 'Cannot read the loaded cartridge for wipe protection; '
                                   f'no erase command was sent: {exc.strerror or exc}') from exc
                 record, unreadable = None, True
@@ -3680,9 +3688,15 @@ def serve_ssh_source():
         send_packet(outgoing, b"e")
 
 
-def backup(source, media, *, level="full", base=None, volume_size=None,
+def backup(source, media, *, level="full", base=None, append_after=None, volume_size=None,
            buffer_size=DEFAULT_BUFFER, quiet=False, ssh=None, append=False, excludes=None, verify=False,
            dry_run=False, cartridge_capacity=None):
+    if append_after is not None:
+        if base is not None:
+            raise BackupError('--base and --append-after cannot be combined')
+        if level != 'full':
+            raise BackupError('--append-after requires --level full')
+        valid_id(append_after)
     source = Path(source) if ssh else Path(source).resolve()
     if ssh and not source.is_absolute():
         raise BackupError("SSH --source must be an absolute path on the remote machine")
@@ -3709,9 +3723,18 @@ def backup(source, media, *, level="full", base=None, volume_size=None,
         frame_size = min(frame_size, (volume_size // BLOCK_SIZE - 2) * BLOCK_SIZE)
     if not ssh:
         require_tar()
-    with (nullcontext() if dry_run and not base else media.lock()), ram_snapshot() as snapshot_fd, append_resources(media):
+    with (nullcontext() if dry_run and not (base or append_after) else media.lock()), \
+            ram_snapshot() as snapshot_fd, append_resources(media):
         parent = None
         parent_created = None
+        append_job = None
+        if append_after is not None:
+            append_job = (inspect_backup(media, append_after) if dry_run else
+                          prepare_append(media, append_after, snapshot_fd))
+            # Share the cartridge, but start a fresh tar snapshot so this full
+            # includes unchanged files and restores without the previous backup.
+            os.ftruncate(snapshot_fd, 0)
+            os.lseek(snapshot_fd, 0, os.SEEK_SET)
         if base:
             valid_id(base)
             log(f"Loading the incremental snapshot from backup {base}")
@@ -3740,10 +3763,12 @@ def backup(source, media, *, level="full", base=None, volume_size=None,
                 raise BackupError("Incremental source differs from the parent backup")
             if dry_run:
                 return backup_preview(source, level, base, estimated_bytes, buffer_size,
-                                      cartridge_capacity or volume_size, excludes=excludes, ssh=ssh)
+                                      cartridge_capacity or volume_size, excludes=excludes, ssh=ssh,
+                                      append_after=append_after)
             return write_backup(source, media, level, base, volume_size, buffer_size, quiet,
                                 snapshot_fd, estimated_bytes, remote, frame_size, excludes=excludes,
-                                parent_job=parent, verify=verify, cartridge_capacity=cartridge_capacity)
+                                parent_job=parent, verify=verify, cartridge_capacity=cartridge_capacity,
+                                append_job=append_job)
         finally:
             if remote:
                 remote.close()
@@ -4572,6 +4597,7 @@ def make_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''File backup and recovery:
   backup --source /opt --level full             Back up files to a blank tape
+  backup --source /srv --append-after LAST_ID    Append an independent full backup
   backup --source /opt --level incremental --base ID
                                                 Append changes to the last backup
   inspect                                      List backups from tape metadata
@@ -4594,7 +4620,7 @@ Pipe streaming (arbitrary bytes; no remote helper required):
 
 Check the drive: status, doctor, compression status.
 Manage the tape: rewind, compression on|off, wipe (destructive), eject.
-Start full backups on blank tapes, or use zfs-backup --append-after ID.
+Start full backups on blank tapes, or use backup/zfs-backup --append-after ID.
 Incrementals always append to their latest completed parent.
 Run keeper COMMAND --help for options and tape-selection details.
 Default device: /dev/nst0. Backups eject full tapes before requesting the next cartridge.
@@ -4635,7 +4661,10 @@ The final tape stays loaded until you run eject.''')
                         help='Exclude a source-relative file, directory subtree, or wildcard pattern; repeatable')
     create.add_argument('--exclude-from', action='append', type=Path, metavar='FILE',
                         help='Read one exclusion pattern per line from a local file; repeatable')
-    create.add_argument("--base", help="Previous backup ID, required for incremental backups; load its tapes first")
+    append_options = create.add_mutually_exclusive_group()
+    append_options.add_argument("--base", help="Previous backup ID, required for incremental backups; load its tapes first")
+    append_options.add_argument('--append-after', metavar='ID',
+                                help='Append an independent full backup after the latest completed backup ID on tape')
     create.add_argument('--append', action='store_true', help='Optional compatibility flag; incrementals always append')
     create.add_argument("--buffer-size", type=parse_size, default=DEFAULT_BUFFER,
                         help="RAM read-ahead and recovery budgets, each 64KiB to 10GiB (default: 1GiB)")
@@ -4886,7 +4915,7 @@ def main(argv=None):
             return 0 if observations['scan_complete'] else 2
         if args.command == "backup":
             size = args.volume_size or (1024**3 if args.media_dir else None)
-            result = backup(args.source, media, level=args.level, base=args.base,
+            result = backup(args.source, media, level=args.level, base=args.base, append_after=args.append_after,
                             volume_size=size, buffer_size=args.buffer_size, quiet=args.quiet, ssh=ssh,
                             append=args.append, excludes=excludes, verify=args.verify,
                             dry_run=args.dry_run, cartridge_capacity=args.cartridge_capacity)

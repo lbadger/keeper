@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.1 — 2026-10-01
+
+- Add `backup --append-after ID` to append an independent full file backup to an
+  existing tape, using the same append checks as ZFS backups.
+- Clarify that inspection reports checks performed during the current operation,
+  rather than verification history from an earlier backup.
+- Allow an explicitly confirmed wipe of short-record media at the first blank
+  cartridge prompt of a fresh full backup, while retaining append and continuation
+  protection.
+
 ## 1.0.0 — 2026-09-30
 
 First release of Keeper.

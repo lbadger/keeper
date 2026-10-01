@@ -238,6 +238,48 @@ class PromptWipeTests(unittest.TestCase):
         self.assertEqual(self.media.active.records, self.original)
         self.assertFalse(any(c[0] == tb.MTERASE for c in self.controls))
 
+    def test_first_full_tape_with_short_records_can_be_wiped_after_confirmation(self):
+        for record in (b'foreign tape format', self.original[0][:1024]):
+            with self.subTest(record_prefix=record[:32]):
+                self.fresh_full()
+                self.media.active.records[:] = [record, None]
+                self.controls.clear()
+                output = self.request('wipe\nWIPE\n', number=1)
+                self.assertIn('Truncated tape record', output)
+                self.assertIn('Cartridge identity cannot be checked', output)
+                self.assertIn('Blank tape verified', output)
+                self.assertEqual(self.media.active.records, [])
+                self.assertEqual([c for c in self.controls if c[0] == tb.MTERASE],
+                                 [(tb.MTERASE, 0)])
+
+    def test_short_record_wipe_still_requires_fresh_full_and_exact_confirmation(self):
+        for protection in ('continuation', 'used-cartridge', 'ancestor',
+                           'unknown-ancestry', 'unknown-job', 'cancelled'):
+            with self.subTest(protection=protection):
+                self.fresh_full()
+                self.media.active.records[:] = [self.original[0][:1024], None]
+                before = list(self.media.active.records)
+                number = 1
+                if protection == 'continuation':
+                    number = 2
+                elif protection == 'used-cartridge':
+                    self.media.protected_headers.add(hashlib.sha256(self.original[0]).hexdigest())
+                elif protection == 'ancestor':
+                    self.media.protected_backup_ids.add('b' * 32)
+                elif protection == 'unknown-ancestry':
+                    self.media.protected_ancestry_complete = False
+                elif protection == 'unknown-job':
+                    del self.media.protected_backup_ids
+                response = 'wipe\nyes\n\n' if protection == 'cancelled' else 'wipe\n\n'
+                output = self.request(response, number=number)
+                if protection == 'cancelled':
+                    self.assertIn('Wipe cancelled', output)
+                else:
+                    self.assertIn('Truncated tape record', output)
+                    self.assertNotIn('Type WIPE', output)
+                self.assertEqual(self.media.active.records, before)
+        self.assertFalse(any(c[0] == tb.MTERASE for c in self.controls))
+
     def test_unreadable_tapes_remain_protected_on_continuation_and_incremental_jobs(self):
         for protection in ('continuation', 'used-cartridge', 'ancestor', 'unknown-ancestry'):
             with self.subTest(protection=protection):
@@ -263,12 +305,37 @@ class PromptWipeTests(unittest.TestCase):
         with patch.object(TapeVolume, 'next_record', side_effect=OSError(errno.ENODEV, 'Device gone')):
             output = self.request('wipe\n\n', number=1)
         self.assertNotIn('Type WIPE', output)
-        with patch.object(TapeVolume, 'next_record', side_effect=[self.original[0],
-                                                               OSError(errno.EIO, 'Unreadable')]):
-            output = self.request('wipe\nWIPE\n\n', number=1)
-        self.assertIn('Wipe refused or failed', output)
-        self.assertEqual(self.media.active.records, self.original)
+        for error in (OSError(errno.EIO, 'Unreadable'), tb.TruncatedTapeRecord('Short record')):
+            with self.subTest(error=error), patch.object(TapeVolume, 'next_record',
+                                                       side_effect=[self.original[0], error]):
+                output = self.request('wipe\nWIPE\n\n', number=1)
+            self.assertIn('Wipe refused or failed', output)
+            self.assertEqual(self.media.active.records, self.original)
         self.assertFalse(any(c[0] == tb.MTERASE for c in self.controls))
+
+    def test_full_backup_and_restore_after_wiping_short_first_record(self):
+        source = self.root / 'source'
+        source.mkdir()
+        (source / 'book').write_bytes(os.urandom(200000))
+        media = self.media
+        media.active.records[0] = self.original[0][:1024]
+        media.tapes.append(media.active)
+        original_request = media.request
+        def request(backup_id, number, action):
+            if action == 'blank':
+                with terminal('wipe\nWIPE\n') as output:
+                    tb.TapeMedia.request(media, backup_id, number, action)
+                self.assertIn('Blank tape verified', output.getvalue())
+                return
+            return original_request(backup_id, number, action)
+        media.request = request
+        with patch.object(tb, 'start_archive', wraps=tb.start_archive) as archive:
+            backup_id = tb.backup(source, media, buffer_size=256 * 1024, quiet=True)
+        self.assertEqual(archive.call_count, 1)
+        self.assertTrue(media.last_result['archive_complete'])
+        destination = self.root / 'restored'
+        tb.restore([backup_id], destination, media, quiet=True)
+        self.assertEqual(tree_contents(source), tree_contents(destination))
 
     def test_full_backup_continues_after_wiping_unreadable_first_tape_and_restores(self):
         source = self.root / 'source'

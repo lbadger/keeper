@@ -169,6 +169,22 @@ class SSHTests(unittest.TestCase):
             self.assertIn('./change', output.getvalue().splitlines())
         self.restore([full, delta])
 
+    def test_remote_independent_full_discards_previous_snapshot_and_host_identity(self):
+        self.media = tb.FileMedia(self.root / 'append-media')
+        first = tb.backup(self.source, self.media, ssh=self.ssh, quiet=True)
+        tape = next(self.media.directory.glob('*.tape'))
+        before = tape.read_bytes()
+        self.ssh.host = 'other-source'
+        second = tb.backup(self.source, self.media, ssh=self.ssh, append_after=first, quiet=True)
+        self.assertEqual(list(self.media.directory.glob('*.tape')), [tape])
+        self.assertEqual(tape.read_bytes()[:len(before)], before)
+        summary = tb.scan(self.media, second)
+        self.assertIsNone(summary['parent'])
+        self.assertEqual(summary['ancestors'], [])
+        self.assertEqual(summary['ssh'], self.ssh.metadata)
+        self.program.unlink()
+        self.restore([second])
+
     def test_remote_wrong_host_and_path_rejected_before_writing_new_tapes(self):
         full = self.create()
         original = set(self.media.directory.glob("*.tape"))

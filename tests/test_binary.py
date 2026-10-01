@@ -92,7 +92,7 @@ class BinaryTests(unittest.TestCase):
         self.assertIn('file data was not verified', self.last_log)
 
     def test_relocated_binary_without_python_full_and_incremental_restore(self):
-        self.assertEqual(self.run_binary("--version"), "keeper 1.0.0")
+        self.assertEqual(self.run_binary("--version"), "keeper 1.0.1")
         self.assertIn("/dev/nst0", self.run_binary("backup", "--help"))
         self.assertNotIn('--volume-size', self.run_binary('backup', '--help'))
         full = self.run_binary(*self.backup_args)
@@ -268,6 +268,22 @@ class BinaryTests(unittest.TestCase):
         info = json.loads(self.run_binary('verify', '--backup', second, '--media-dir', self.media))
         self.assertTrue(info['data_verified'])
 
+    def test_binary_appends_independent_full_without_external_python(self):
+        args = ['backup', '--source', self.source, '--media-dir', self.media, '--quiet']
+        first = self.run_binary(*args)
+        tape = self.media / f'{first}.0001.tape'
+        before = tape.read_bytes()
+        preview = json.loads(self.run_binary(*args, '--append-after', first, '--dry-run', '--json'))
+        self.assertEqual(preview['append_after'], first)
+        self.assertEqual(tape.read_bytes(), before)
+        second = json.loads(self.run_binary(*args, '--append-after', first, '--verify', '--json'))
+        self.assertTrue(second['data_verified'])
+        self.assertIsNone(second['parent'])
+        self.assertEqual(second['ancestors'], [])
+        self.assertEqual(list(self.media.glob('*.tape')), [tape])
+        self.assertEqual(tape.read_bytes()[:len(before)], before)
+        self.restore([second['id']])
+
     def test_binary_restores_incrementals_across_separate_invocations(self):
         full = self.run_binary(*self.backup_args)
         self.restore([full])
@@ -407,7 +423,7 @@ class BinaryTests(unittest.TestCase):
         text = self.run_binary('info', '--backup', full, '--media-dir', self.media, '--text')
         self.assertIn(full, text)
         self.assertIn('Backup metadata', text)
-        self.assertIn('Not verified; run verify', text)
+        self.assertIn('Not checked during this operation', text)
         result = json.loads(self.run_binary('info', '--backup', full, '--media-dir', self.media, '--json'))
         self.assertFalse(result['data_verified'])
 

@@ -160,8 +160,9 @@ class CLIStatusTests(unittest.TestCase):
                 self.assertNotIn('Compression: Off', text)
 
     def test_info_alias_and_text_inspection_do_not_claim_payload_verification(self):
-        code, backup = self.backup()
+        code, backup = self.backup('--verify')
         self.assertEqual(code, 0)
+        self.assertTrue(backup['data_verified'])
         for command in ('inspect', 'info'):
             output = TerminalOutput()
             with redirect_stdout(output), redirect_stderr(io.StringIO()):
@@ -169,12 +170,13 @@ class CLIStatusTests(unittest.TestCase):
             text = output.getvalue()
             self.assertIn(backup['id'], text)
             self.assertIn('Listing complete', text)
-            self.assertIn('Not verified; run verify', text)
+            self.assertIn('Not checked during this operation', text)
         output = io.StringIO()
         with redirect_stdout(output), redirect_stderr(io.StringIO()):
             self.assertEqual(tb.main(['verify', '--backup', backup['id'], '--media-dir',
                                      str(self.root / 'media'), '--text']), 0)
         self.assertIn('Verified backup', output.getvalue())
+        self.assertIn('Verified during this operation', output.getvalue())
         with next((self.root / 'media').glob('*.tape')).open('ab') as tape:
             tape.write(b'incomplete tail')
         output = io.StringIO()

@@ -21,11 +21,11 @@ staging an archive on disk. Backup metadata travels with the tapes.
 
 ## Install
 
-Download `keeper` and `keeper.sha256` from [v1.0.0](https://github.com/lbadger/keeper/releases/tag/v1.0.0):
+Download `keeper` and `keeper.sha256` from [v1.0.1](https://github.com/lbadger/keeper/releases/tag/v1.0.1):
 
 ```bash
-curl -fLO https://github.com/lbadger/keeper/releases/download/v1.0.0/keeper
-curl -fLO https://github.com/lbadger/keeper/releases/download/v1.0.0/keeper.sha256
+curl -fLO https://github.com/lbadger/keeper/releases/download/v1.0.1/keeper
+curl -fLO https://github.com/lbadger/keeper/releases/download/v1.0.1/keeper.sha256
 sha256sum --check keeper.sha256
 chmod +x keeper
 ./keeper --version
@@ -75,6 +75,16 @@ SSH identity, and exclusions must match, and the base must be the last completed
 backup on its final cartridge. Restore requires the full backup and every
 incremental through the chosen recovery point, in order.
 
+To add an independent full backup to the same tape, use the last completed ID:
+
+```bash
+./keeper backup --source /srv/other-data --append-after LAST_BACKUP_ID --verify
+```
+
+Load that backup's final cartridge. The new full can use a different source or
+exclusions and restores with its own ID alone. `--append-after` cannot be combined
+with `--base` or `--level incremental`.
+
 Use a filesystem snapshot or pause applications for a consistent source.
 Keeper includes mounted directories below the source and does not follow symlinks.
 
@@ -107,6 +117,11 @@ unavailable, ordinary `list` scans the selected backup; `--index-only` prevents
 that fallback. Use `list --scan` to read and verify the archive while listing.
 For tape inspection without a usable catalog, `inspect --scan` permits a full
 cartridge scan. Tape scans can take a long time.
+
+Inspection reports `Data checksums: Not checked during this operation`, even
+after a successful backup with `--verify`. This describes the inspection itself;
+verification history is not stored on tape. Use `--verify --json` when backing up
+to capture the successful read-back result as `data_verified: true`.
 
 If read-back verification fails after a backup was committed, retain its tapes
 and retry `verify --backup ID`. The committed backup has not been erased.
@@ -187,9 +202,9 @@ use shell `pipefail` and check the pipeline status. See [pipe workflows](docs/re
 | `./keeper compression status` | Show hardware compression; use `on` or `off` to change it |
 | `./keeper wipe` | **Erase the loaded tape**, after a `WIPE` confirmation |
 
-Full backups normally require blank media. ZFS `--append-after` is the option
-for adding an independent full to an existing tape. Continuation cartridges must
-be blank. Keeper never erases automatically.
+Full backups normally require blank media. Both `backup` and `zfs-backup` accept
+`--append-after LAST_BACKUP_ID` to add an independent full to an existing tape.
+Continuation cartridges must be blank. Keeper never erases automatically.
 
 At a tape-change prompt, press Enter after loading the requested cartridge,
 use `eject` to unload, or `q` to stop. Blank-cartridge prompts also offer `wipe`
@@ -266,4 +281,4 @@ relying on it. Checksums detect corruption; they do not authenticate or encrypt
 ordinary file backups.
 
 See the [full reference](docs/reference.md), [streaming design](docs/continuous-streaming.md),
-[append design](docs/append-incrementals.md), and [release notes](docs/releases/v1.0.0.md).
+[append design](docs/append-incrementals.md), and [release notes](docs/releases/v1.0.1.md).

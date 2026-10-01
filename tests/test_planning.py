@@ -184,6 +184,36 @@ class PlanningTests(unittest.TestCase):
         self.assertFalse(result['tape_readiness_checked'])
         self.assertFalse(self.media.directory.exists())
 
+    def test_full_append_cli_preview_and_verified_write(self):
+        self.media.label_prefix = 'ORIGINAL'
+        first = self.create(excludes=['deleted'])
+        args = ['backup', '--source', self.source, '--append-after', first,
+                '--media-dir', self.media.directory, '--buffer-size', '64KiB', '--json',
+                '--label-prefix', 'NEW', '--log-file', self.root / 'cli.log']
+        before = tree_contents(self.media.directory)
+        with patch.object(tb, 'start_archive', side_effect=AssertionError('started tar')), \
+                patch.object(tb, 'prepare_append', side_effect=AssertionError('prepared writer')):
+            preview = json.loads(self.cli(*args, '--dry-run'))
+        self.assertEqual(preview['append_after'], first)
+        self.assertEqual(preview['level'], 'full')
+        self.assertIsNone(preview['parent'])
+        self.assertEqual(preview['excludes'], [])
+        self.assertFalse(preview['tape_readiness_checked'])
+        self.assertIn(first, tb.format_backup_preview(preview))
+        self.assertEqual(tree_contents(self.media.directory), before)
+        result = json.loads(self.cli(*args, '--verify'))
+        self.assertTrue(result['data_verified'])
+        self.assertIsNone(result['parent'])
+        self.assertEqual(len(list(self.media.directory.glob('*.tape'))), 1)
+        entries = self.observe()
+        self.assertEqual({entry['cartridge_label'] for entry in entries}, {'ORIGINAL-001'})
+        plan = tb.restore_plan(result['id'], entries)
+        self.assertTrue(plan['plan_complete'])
+        self.assertEqual(plan['backup_ids'], [result['id']])
+        self.cli('restore', '--to', result['id'], '--media-dir', self.media.directory,
+                 '--destination', self.root / 'restored')
+        self.assertEqual(tree_contents(self.source), tree_contents(self.root / 'restored'))
+
     def test_incremental_preview_inherits_exclusions_and_preserves_tape(self):
         full = self.create(excludes=['deleted'])
         before = tree_contents(self.media.directory)

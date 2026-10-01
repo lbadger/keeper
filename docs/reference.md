@@ -15,7 +15,7 @@ Source file contents are never staged on disk. A successful command prints the
 backup ID on stdout; interactive progress uses stderr and file names go to the log file. Label every cartridge
 with that ID and the volume number shown in the prompt.
 
-**A new full backup requires a blank first cartridge.** Initialize previously used
+**Without `--append-after`, a new full backup requires a blank first cartridge.** Initialize previously used
 media with the explicit `wipe` command, or type `wipe` at the backup's load prompt
 and confirm with `WIPE`. Incrementals always validate the existing tail and write
 after recorded data. Every continuation cartridge must be blank; recorded or
@@ -28,6 +28,28 @@ pressing Enter alone cannot authorize overwriting recorded data.
 Other drive errors or failures after writing begins still stop the operation when
 they cannot be recovered safely.
 Every backup has its own ID and volume numbers, even when sharing a cartridge.
+
+To append an independent full backup to an existing tape:
+
+```bash
+./keeper backup --source /opt/documents --append-after LAST_BACKUP_ID --verify
+```
+
+Load the last completed backup's final cartridge. Keeper validates its completion,
+metadata, and clean recorded end using the same append checks as incrementals and
+`zfs-backup --append-after`. A stale ID or incomplete tail is refused before writing.
+The preceding backup can have a different source, SSH identity, exclusions, or
+archive type. The new backup starts with a fresh tar snapshot, includes all selected
+files, and has no restore dependency on the preceding backup. Restore it using only
+its own ID; later incrementals can use that ID as `--base`.
+
+`--append-after` requires `--level full` (the default) and cannot be combined with
+`--base` or the incremental compatibility flag `--append`. The existing cartridge's
+label is retained. If it fills, Keeper requests blank continuation cartridges while
+protecting the preceding backup and its chain from prompt-driven wipes.
+With `--dry-run`, Keeper reads the selected backup's metadata and estimates the
+full source size without starting an archive or writing tape; the actual backup
+still validates the writable end position.
 
 ```mermaid
 flowchart TD
@@ -527,7 +549,9 @@ a committed archive whose tail cannot
 be appended to; `append_ready: null` reports that uncertainty. Without `--json`,
 successful backups still print only their ID on stdout. `--verify` performs a
 full read-back after backup; only successful verification sets `data_verified`
-true. Verification failures return nonzero and identify the committed backup.
+true in that command's result. The result is not written back to the tape;
+later inspection does not report this verification history. Verification failures
+return nonzero and identify the committed backup.
 With `--verify`, writing occupies the first half of total progress and read-back
 the second half, using the actual committed archive size. The drive lock is held
 through both passes. The display reaches 100% only after verification succeeds;
@@ -899,6 +923,13 @@ single object with `volume: 1` and `header_verified: true`, without reading the
 archive or incremental snapshot.
 
 All inspection modes leave `data_verified` and `completion_verified` false.
+These fields describe checks performed during the current command, not whether
+verification succeeded on a previous run. Text inspection displays
+`Data checksums: Not checked during this operation`, including after a successful
+backup with `--verify`. Keeper does not store verification history on tape or in
+the optional inventory. A successful backup with `--verify --json` reports
+`data_verified: true` in its completion result; retain that result when you need
+a record of the read-back check.
 Readable headers, catalogs, and completion markers do not establish that an
 entire backup is restorable. `verify` reads all volumes without extracting files
 and reports `data_verified: true` only after validating the full stream and
@@ -1144,9 +1175,11 @@ recorded ancestor, and remembers first-header fingerprints of cartridges already
 selected for appending during this job. It rechecks the loaded header after the
 confirmation. Unreadable or corrupt recognized headers are normally refused.
 At the **first cartridge of a new full backup**, before any cartridge has been
-written and with no ancestors to protect, an I/O error reading the old contents
-does not prevent an explicitly confirmed wipe. The prompt warns that cartridge
-identity cannot be checked and still requires `WIPE`; the erase and subsequent
+written and with no ancestors to protect, an I/O error or a short record while
+reading the old contents does not prevent an explicitly confirmed wipe. A record
+shorter than Keeper's 64 KiB record size can belong to another tape format; the
+boundary check cannot determine whether it is damaged. The prompt warns that
+cartridge identity cannot be checked and still requires `WIPE`; the erase and subsequent
 blank verification must succeed. This matches standalone wipe's ability to erase
 unreadable old contents. Continuations and incremental backups retain the read
 requirement. Check the

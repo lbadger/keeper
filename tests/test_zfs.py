@@ -142,6 +142,20 @@ class ZFSStreamTests(unittest.TestCase):
         self.assertIn('book', output.getvalue())
         self.assertTrue(tb.scan(self.media, second)['data_verified'])
 
+    def test_tar_full_can_append_after_zfs_without_reusing_its_snapshot(self):
+        first = self.create(identity())
+        source = self.root / 'source'
+        source.mkdir()
+        (source / 'book').write_text('independent tar data')
+        tape = next(self.media.directory.glob('*.tape'))
+        before = tape.read_bytes()
+        second = tb.backup(source, self.media, append_after=first, quiet=True, verify=True)
+        self.assertEqual(tape.read_bytes()[:len(before)], before)
+        self.assertEqual(len(list(self.media.directory.glob('*.tape'))), 1)
+        self.assertTrue(tb.scan(self.media, first)['data_verified'])
+        tb.restore([second], self.root / 'restored', self.media, quiet=True)
+        self.assertEqual(tree_contents(source), tree_contents(self.root / 'restored'))
+
     def test_independent_append_rollover_protects_previous_backup_chain(self):
         self.media = TapeMedia()
         metadata = identity()

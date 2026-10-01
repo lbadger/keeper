@@ -1,7 +1,7 @@
-# Appending incrementals and on-tape metadata
+# Appending backups and on-tape metadata
 
-Included in Keeper v1.0.0. Automated checks use
-file-backed media and a cartridge simulator.
+Incremental appending is included in Keeper v1.0.0; independent full tar appending
+is available in v1.0.1. Automated checks use file-backed media and a cartridge simulator.
 Physical-drive qualification remains outstanding. See the [README](../README.md)
 for common commands.
 
@@ -21,6 +21,20 @@ its volume numbers are independent of physical cartridge labels.
 
 Every incremental appends automatically. `--append` remains an optional
 compatibility flag; omitting it cannot select an overwrite path.
+
+To append an independent full tar backup, use:
+
+```bash
+./keeper backup --source /opt/other --append-after LAST_BACKUP_ID --device /dev/nst0
+```
+
+This uses the same completed-tail validation and append positioning, but discards
+the previous snapshot before starting GNU tar locally or over SSH. The new full
+includes all selected files and starts its own restore chain. Its source, SSH
+identity, and exclusions may differ from the previous backup, which may also be
+a ZFS or byte-stream backup. `--append-after` is exclusive with `--base` and only
+accepts the full level. The writer protects the preceding backup and its ancestors
+during media changes without recording them as restore dependencies.
 
 Recorded continuation cartridges are refused before writing, and the same volume
 is requested again while the source and recovery buffers remain live. Both manual

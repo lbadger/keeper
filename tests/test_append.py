@@ -1,5 +1,5 @@
 """Same-cartridge chains and a record/filemark/EOD tape simulator."""
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import errno
 import io
 import os
@@ -186,6 +186,129 @@ class AppendTests(unittest.TestCase):
         destination = self.root / ('restore-' + str(len(list(self.root.glob('restore-*')))))
         tb.restore(ids, destination, media, quiet=True)
         self.assertEqual(tree_contents(destination), expected)
+
+    def test_independent_full_and_incremental_preserve_tape_and_restore_separately(self):
+        for media in (tb.FileMedia(self.root / 'media'), TapeMedia()):
+            with self.subTest(physical=isinstance(media, TapeMedia)):
+                first = self.backup(media, excludes=['remove'])
+                first_tree = tree_contents(self.source)
+                del first_tree['remove']
+                if isinstance(media, TapeMedia):
+                    tape = media.tapes[0]
+                    contents = lambda: list(tape.records)
+                else:
+                    tape = next(media.directory.glob('*.tape'))
+                    contents = tape.read_bytes
+                before = contents()
+                # Even unchanged files must be archived again, with fresh exclusions.
+                second_tree = tree_contents(self.source)
+                second = self.backup(media, append_after=first, verify=True)
+                self.assertTrue(media.last_result['data_verified'])
+                self.assertEqual(contents()[:len(before)], before)
+                (self.source / 'remove').write_text('new incremental content')
+                delta = self.backup(media, second)
+                for ids, expected in (([first], first_tree), ([second], second_tree),
+                                      ([second, delta], tree_contents(self.source))):
+                    self.restore(media, ids, expected)
+                    summary = tb.scan(media, ids[-1])
+                    self.assertTrue(summary['data_verified'])
+                    self.assertEqual(summary['ancestors'], ids[:-1])
+                    self.assertEqual(summary['parent'], second if len(ids) > 1 else None)
+                self.assertEqual(len(media.tapes) if isinstance(media, TapeMedia) else
+                                 len(list(media.directory.glob('*.tape'))), 1)
+                entries = tb.inspect_all(media)['backups']
+                self.assertEqual([entry['id'] for entry in entries], [first, second, delta])
+                self.assertEqual(tb.restore_plan(second, entries)['backup_ids'], [second])
+                for backup_id in (first, second):
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        tb.list_files(media, backup_id, index_only=True)
+                    self.assertIn('./book', output.getvalue().splitlines())
+                self.assertIsNone(media.append_volume)
+                self.assertFalse(media.append_mode)
+
+    def test_independent_full_can_use_different_source_and_exclusions(self):
+        media = tb.FileMedia(self.root / 'media')
+        first = self.backup(media, excludes=['remove'])
+        other = self.root / 'other'
+        other.mkdir()
+        (other / 'keep').write_text('different source')
+        (other / 'skip').write_text('excluded')
+        second = tb.backup(other, media, append_after=first, excludes=['skip'], quiet=True)
+        expected = tree_contents(other)
+        del expected['skip']
+        self.restore(media, [second], expected)
+        summary = tb.scan(media, second)
+        self.assertEqual(summary['source'], str(other))
+        self.assertEqual(summary['excludes'], ['skip'])
+
+    def test_independent_full_refuses_stale_or_incomplete_tail_without_writing(self):
+        for media in (tb.FileMedia(self.root / 'media'), TapeMedia()):
+            with self.subTest(physical=isinstance(media, TapeMedia)):
+                first = self.backup(media)
+                second = self.backup(media, append_after=first)
+                def contents():
+                    return ([list(tape.records) for tape in media.tapes] if isinstance(media, TapeMedia)
+                            else tree_contents(media.directory))
+                before = contents()
+                with self.assertRaises(tb.BackupError):
+                    self.backup(media, append_after=first)
+                self.assertEqual(contents(), before)
+                with patch.object(tb, 'start_archive', side_effect=tb.BackupError('Source failure')):
+                    with self.assertRaisesRegex(tb.BackupError, 'Source failure'):
+                        self.backup(media, append_after=second)
+                before = contents()
+                with self.assertRaises(tb.BackupError):
+                    self.backup(media, append_after=second)
+                self.assertEqual(contents(), before)
+                self.assertIsNone(media.append_volume)
+                self.assertFalse(media.append_mode)
+                for backup_id in (first, second):
+                    self.restore(media, [backup_id], tree_contents(self.source))
+
+    def test_independent_full_without_footer_scans_and_starts_fresh_snapshot(self):
+        media = tb.FileMedia(self.root / 'media')
+        with patch.object(tb, 'write_metadata', return_value=False):
+            first = self.backup(media)
+        tape = next(media.directory.glob('*.tape'))
+        before = tape.read_bytes()
+        second = self.backup(media, append_after=first)
+        self.assertIn('scanning the base', self.output.getvalue())
+        self.assertEqual(tape.read_bytes()[:len(before)], before)
+        self.restore(media, [second], tree_contents(self.source))
+
+    def test_independent_full_rollover_protects_preceding_chain(self):
+        for cap in (None, 256 * 1024):
+            with self.subTest(volume_size=cap):
+                media = TapeMedia(capacity=30)
+                first = self.backup(media)
+                delta = self.backup(media, first)
+                previous_tree = tree_contents(self.source)
+                before = [(tape, list(tape.records)) for tape in media.tapes]
+                (self.source / 'large').write_bytes(os.urandom(2_000_000))
+                second = self.backup(media, append_after=delta, volume_size=cap)
+                self.assertTrue({first, delta, second}.issubset(media.protected_backup_ids))
+                self.assertTrue(media.protected_headers)
+                self.assertGreater(len(media.tapes), len(before))
+                for tape, records in before:
+                    self.assertEqual(tape.records[:len(records)], records)
+                self.restore(media, [first, delta], previous_tree)
+                self.restore(media, [second], tree_contents(self.source))
+                self.assertEqual(tb.scan(media, second)['ancestors'], [])
+                (self.source / 'large').unlink()
+
+    def test_invalid_full_append_options_fail_before_media_access(self):
+        identifier = 'a' * 32
+        for options, message in (({'base': identifier}, 'cannot be combined'),
+                                 ({'level': 'incremental'}, 'requires --level full'),
+                                 ({'append': True}, '--append requires'),
+                                 ({'append_after': 'invalid'}, 'Invalid backup ID')):
+            with self.subTest(options=options), self.assertRaisesRegex(tb.BackupError, message):
+                tb.backup(self.source, None, **{'append_after': identifier, **options})
+        with self.assertRaises(SystemExit) as error:
+            tb.make_parser().parse_args(['backup', '--source', str(self.source),
+                                         '--base', identifier, '--append-after', identifier])
+        self.assertEqual(error.exception.code, 2)
 
     def test_file_cartridge_two_appends_preserve_bytes_and_all_recovery_points(self):
         media = tb.FileMedia(self.root / 'media')
