@@ -410,7 +410,7 @@ class StreamingTests(unittest.TestCase):
             header = first.read(tb.BLOCK_SIZE)
         fields = tb.decoded_header(header)
         cases = [
-            ('checksum', header.replace(full.encode(), b'f' * 32), None),
+            ('checksum', header.replace(full.encode(), b'f' * len(full)), None),
             ('truncated', header[:-1], None),
             ('wrong backup', header, '0' * 32),
             ('wrong volume', tb.encoded_header({**fields, 'volume': 2}), None),

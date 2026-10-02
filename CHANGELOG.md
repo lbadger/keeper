@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0 — 2026-10-02
+
+- Use seven-character, case-sensitive backup IDs for new backups, with collision
+  checks against available metadata and continued support for existing 32-character IDs.
+- Add `zfs-restore --backup ID --output FILE` to export a verified native ZFS send
+  stream without ZFS installed, for later recovery with `zfs receive`.
+- Add `zfs-restore --backup ID --stdout` to pipe the original send stream directly
+  to another command, with payload-only stdout and failure exit status.
+
 ## 1.0.1 — 2026-10-01
 
 - Add `backup --append-after ID` to append an independent full file backup to an

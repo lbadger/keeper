@@ -217,6 +217,25 @@ prevents further appends. Preserve that cartridge for restore; a new full backup
 on separate media can start a new chain. The catalog
 is limited to 64 MiB; snapshots are held in RAM. There is no MAM dependency.
 
+## Backup IDs
+
+New file, ZFS, and byte-stream backups use seven-character IDs such as `7aQm3Kx`.
+IDs are case-sensitive and use letters and digits, excluding `0`, `O`, `I`, and
+lowercase `l`. The printed ID is the complete ID stored on tape, not an abbreviation.
+Use it unchanged with `--backup`, `--base`, `--append-after`, and `--to`.
+
+Keeper chooses IDs randomly and retries if an ID is already present in the supplied
+inventory, the append cartridge's catalog, the known ancestor chain, or the available
+file-media catalogs and filenames. No central registry is required. To cover offline
+cartridges, keep and pass a shared `--inventory`; IDs cannot be checked against tapes
+or inventories that are unavailable.
+
+Existing 32-character hexadecimal backup IDs remain valid, including when adding
+new incrementals to an older backup or continuing an older restore. Cartridge IDs
+retain their separate 32-character format. Older Keeper executables that require
+32-character backup IDs cannot read newly created short-ID backups; use the updated
+executable for these tapes.
+
 ## Native ZFS streaming
 
 Use `zfs-backup` to stream an **existing filesystem snapshot** with `zfs send`.
@@ -278,9 +297,63 @@ Receive a full chain into a **new child dataset** whose parent already exists:
 ./keeper zfs-restore --backup DELTA_ID --dataset tank/recovered
 ```
 
-ZFS restore verifies every requested backup before receiving it, then reads it
-again for `zfs receive`. Allow for two tape passes. It checks received snapshot
-GUIDs, records the last completed backup in `org.tape-backup:restore`, and blocks
+To get a backup off tape **without ZFS installed**, export its original send stream
+to a regular file:
+
+```bash
+./keeper zfs-restore --backup FULL_ID --output /srv/recovery/full.zfs
+./keeper zfs-restore --backup DELTA_ID --output /srv/recovery/delta.zfs
+
+# Later, on a ZFS machine, receive each file into the same dataset in order.
+# The parent pool/dataset must already exist; tank/recovered must be new.
+zfs receive -u -o readonly=on -o canmount=off -o mountpoint=none \
+  -o sharenfs=off -o sharesmb=off tank/recovered < /srv/recovery/full.zfs
+zfs receive -u tank/recovered < /srv/recovery/delta.zfs
+```
+
+`--output FILE`, `--stdout`, and `--dataset` are mutually exclusive. Export takes exactly one
+`--backup ID`, including an incremental on its own; it does not require its parent
+tapes. The parent snapshot is required when **receiving** that incremental later.
+Use `--to ID --plan` to find the chain, then export each backup to its own file;
+`--to` cannot be combined with `--output` for an export. Do not concatenate the
+files into a single receive invocation.
+
+Export reads each tape once, removes Keeper framing, and verifies every data
+checksum and the backup completion marker. It streams into a temporary file beside
+the output, flushes it, then publishes the verified file without overwriting any
+existing path. The destination filesystem must support hard links for this atomic
+publication. Failed or cancelled exports remove the temporary file. Allow disk
+space for the whole send stream. The result contains native ZFS data, not extracted
+files; raw encrypted streams remain encrypted and need their keys when accessed.
+OpenZFS validates the native stream when it is received. Manual `zfs receive`
+commands do not update Keeper's restore-history property; receive subsequent
+exported incrementals manually too.
+
+Use `--stdout` for a pipe, including to `zfs receive` on another machine:
+
+```bash
+set -o pipefail
+./keeper zfs-restore --backup FULL_ID --stdout | \
+  ssh recovery-host zfs receive -u -o readonly=on -o canmount=off \
+    -o mountpoint=none -o sharenfs=off -o sharesmb=off tank/recovered
+# After the full receive succeeds:
+./keeper zfs-restore --backup DELTA_ID --stdout | \
+  ssh recovery-host zfs receive -u tank/recovered
+```
+
+Like `stream-restore`, `--stdout` emits only data bytes; diagnostics use stderr/the
+log file. It refuses to write binary data to a terminal and requires one explicit
+`--backup ID`, without `--to`. It reads tapes once without staging the stream on
+disk or requiring ZFS locally. Each frame is verified before emission, but a later
+checksum, missing completion marker, interruption, or broken pipe can still fail
+the export after some bytes have been delivered. Check **both sides** of the pipe
+(for example with Bash `pipefail`); discard failed file output or recover the
+downstream dataset before retrying. Use `--output FILE` when you want Keeper to
+publish only a fully verified file.
+
+With `--dataset`, ZFS restore verifies every requested backup before receiving it,
+then reads it again for `zfs receive`. Allow for two tape passes. It checks received
+snapshot GUIDs, records the last completed backup in `org.tape-backup:restore`, and blocks
 continuation after an incomplete receive. It never uses `zfs receive -F`, rolls
 back an existing dataset, or overwrites an unrelated destination.
 
@@ -624,7 +697,7 @@ extra tape scans just to obtain a progress denominator. A large full archive and
 a small incremental can therefore take different amounts of time for equal
 portions of that estimated bar.
 
-In-place incremental restores and native ZFS restores already verify before
+In-place incremental restores and ZFS restores with `--dataset` verify before
 applying data. Their total bar includes verification as the first half and
 application as the second half. Verification estimates progress by archive;
 application uses the exact verified archive sizes. Unknown sizes are shown as

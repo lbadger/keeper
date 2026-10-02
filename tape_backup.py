@@ -16,6 +16,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import select
 import shlex
 import shutil
@@ -41,8 +42,11 @@ MAGIC = b"TAPE-STREAM-3\n"
 ZFS_MAGIC = b"TAPE-STREAM-4\n"
 STREAM_MAGIC = b"TAPE-STREAM-5\n"
 ARCHIVE_FORMATS = {'tar': 3, 'zfs': 4, 'stream': 5}
+BACKUP_ID_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+BACKUP_ID_LENGTH = 7
+BACKUP_ID_PATTERN = rf'(?:[{BACKUP_ID_ALPHABET}]{{{BACKUP_ID_LENGTH}}}|[0-9a-f]{{32}})'
 ZERO_CHAIN = "0" * 64
-PROGRAM_VERSION = "1.0.1"
+PROGRAM_VERSION = "1.1.0"
 PROGRAM_NAME = 'keeper'
 HELP_BANNER = r""" _  __
 | |/ /___  ___ _ __   ___ _ __
@@ -287,8 +291,38 @@ def locked(directory):
 
 
 def valid_id(value):
-    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
+    if not isinstance(value, str) or not re.fullmatch(BACKUP_ID_PATTERN, value):
         raise BackupError("Invalid backup ID; use the ID printed on the tape label")
+    return value
+
+
+def new_backup_id(media, *related_jobs):
+    """Choose a short ID distinct from the available media and backup history."""
+    known = set()
+    jobs = [job for job in related_jobs if job is not None]
+    jobs.extend(getattr(media, 'entries', []))
+    jobs.extend(getattr(media, 'inventory_entries', []))
+    if isinstance(media, FileMedia):
+        paths = list(media.directory.glob('*.tape'))
+        known.update(path.name.split('.')[0] for path in paths)
+        if paths:
+            # Include appended backups whose IDs do not appear in filenames.
+            # Read catalogs/headers only, without scanning archive payloads.
+            jobs.extend(inspect_all(media, allow_scan=False, header_fallback=True)['backups'])
+    for job in jobs:
+        known.add(job['id'])
+        known.add(job.get('parent'))
+        known.update(job.get('ancestors', []))
+    for _ in range(100):
+        identifier = ''.join(secrets.choice(BACKUP_ID_ALPHABET) for _ in range(BACKUP_ID_LENGTH))
+        if identifier not in known:
+            return identifier
+    raise BackupError('Could not allocate an unused backup ID; no backup was written')
+
+
+def valid_cartridge_id(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[0-9a-f]{32}', value):
+        raise BackupError('Invalid cartridge ID')
     return value
 
 
@@ -334,7 +368,7 @@ def cartridge_identity(head, fallback=None):
         return {'id': fallback, 'label': None}
     if not isinstance(value, dict):
         raise BackupError('Invalid cartridge identity')
-    valid_id(value.get('id'))
+    valid_cartridge_id(value.get('id'))
     if value.get('label') is not None:
         valid_label(value['label'])
     return {'id': value['id'], 'label': value.get('label')}
@@ -813,7 +847,8 @@ class Progress:
             eta = f"~{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
         job_eta = self.job_eta(now, eta)
         if sys.stderr.isatty():
-            label = f'Backup {self.label[:12]}' if re.fullmatch('[0-9a-f]{32}', self.label) else self.label
+            label = (f'Backup {self.label[:12]}' if self.buffer_size is not None and
+                     re.fullmatch(BACKUP_ID_PATTERN, self.label) else self.label)
             width = terminal_width(sys.stderr)
             if self.screen is not None:
                 width = max(16, width - 1)  # Reserve the terminal's auto-wrap column.
@@ -3292,6 +3327,60 @@ def check_zfs_base(dataset, metadata):
         raise BackupError('ZFS destination has a newer snapshot; refusing to roll it back')
 
 
+def export_zfs(backup_id, output, media, *, cartridge_capacity=None):
+    """Save one original send stream, publishing it only after tape verification."""
+    valid_id(backup_id)
+    requested = Path(output).absolute()
+    output = requested.parent.resolve() / requested.name
+    if isinstance(media, FileMedia) and inside(output, media.directory):
+        raise BackupError('ZFS output file and media must be separate')
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with restore_lock(output):
+        if os.path.lexists(output):
+            raise BackupError(f'ZFS output file already exists; choose a new path: {output}')
+        with media.lock(), Progress('ZFS export', archives=1) as progress:
+            progress.cartridge_capacity = cartridge_capacity
+            progress.seed_archives([backup_id], media)
+            progress.track_archive(None, stage='restore')
+            reader = StreamReader(media, backup_id, progress)
+            try:
+                reader.next_volume()
+                if reader.job.get('archive_type') != 'zfs':
+                    raise BackupError('ZFS export requires a native ZFS backup; use restore for tar '
+                                      'archives or stream-restore for byte streams')
+                progress.estimate(reader.job.get('estimated_bytes'))
+                progress.phase = f'exporting {backup_id} to {output}'
+                # Only data frames belong in a zfs receive input. Keeper's
+                # headers, snapshot identity, and completion marker stay out.
+                with tempfile.NamedTemporaryFile(prefix=f'.{output.name}.restoring-',
+                                                 dir=output.parent) as stream:
+                    for kind, payload in reader.frames():
+                        if kind == 'data':
+                            stream.write(payload)
+                            progress.read_bytes += len(payload)
+                            progress.written_bytes += len(payload)
+                            progress.advance(len(payload))
+                    progress.phase = 'flushing verified ZFS stream'
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    # Linking is atomic and refuses a destination that appeared
+                    # during export, unlike replace/rename which can overwrite it.
+                    try:
+                        os.link(stream.name, output)
+                    except FileExistsError as exc:
+                        raise BackupError(f'ZFS output file already exists; choose a new path: {output}') from exc
+                fsync_dir(output.parent)
+                progress.finish_archive()
+                progress.phase = 'complete'
+                log(f'Exported ZFS stream {backup_id}: {reader.summary["data_bytes"]} bytes; '
+                    'checksums verified. Receive this file later with zfs receive.')
+                if reader.job['parent']:
+                    log(f'Incremental stream: receive parent backup {reader.job["parent"]} first.')
+            finally:
+                reader.close()
+    return output
+
+
 def restore_zfs(backup_ids, dataset, media, *, cartridge_capacity=None):
     zfs_name(dataset)
     if not backup_ids or len(set(backup_ids)) != len(backup_ids):
@@ -3315,7 +3404,7 @@ def restore_zfs(backup_ids, dataset, media, *, cartridge_capacity=None):
                 raise BackupError('Keep the ZFS destination readonly between incremental restores')
             if previous_id.startswith('pending:'):
                 raise BackupError('A previous ZFS receive did not complete; restore into a separate dataset')
-            if not re.fullmatch('[0-9a-f]{32}', previous_id):
+            if not re.fullmatch(BACKUP_ID_PATTERN, previous_id):
                 raise BackupError('Existing ZFS destination is not a completed keeper restore; choose a new dataset')
         verified, previous = {}, None
         # Verify every requested stream before any receive can alter a dataset.
@@ -3894,19 +3983,24 @@ def backup_stream(name, media, *, command=None, input_fd=0, estimated_bytes=None
                             stream=source, verify=verify, cartridge_capacity=cartridge_capacity)
 
 
-def restore_stream(backup_id, media, output, *, cartridge_capacity=None):
+def restore_stream(backup_id, media, output, *, cartridge_capacity=None, archive_type='stream'):
     """Emit verified data frames only; success also requires the completion marker."""
     valid_id(backup_id)
+    command = 'zfs-restore --stdout' if archive_type == 'zfs' else 'stream-restore'
     if output.isatty():
-        raise BackupError('Redirect stream-restore stdout to a file or pipe')
-    with media.lock(), Progress('Stream restore', archives=1) as progress:
+        raise BackupError(f'Redirect {command} stdout to a file or pipe')
+    with media.lock(), Progress('ZFS stream export' if archive_type == 'zfs' else 'Stream restore',
+                                archives=1) as progress:
         progress.cartridge_capacity = cartridge_capacity
         progress.seed_archives([backup_id], media)
         progress.track_archive(None, stage='restore')
         reader = StreamReader(media, backup_id, progress)
         try:
             reader.next_volume()
-            if reader.job.get('archive_type') != 'stream':
+            if reader.job.get('archive_type') != archive_type:
+                if archive_type == 'zfs':
+                    raise BackupError('zfs-restore --stdout requires a native ZFS backup; '
+                                      'use restore for tar archives or stream-restore for byte streams')
                 raise BackupError('stream-restore requires a byte-stream backup; use restore or zfs-restore')
             progress.estimate(reader.job.get('estimated_bytes'))
             for kind, payload in reader.frames():
@@ -3924,6 +4018,8 @@ def restore_stream(backup_id, media, output, *, cartridge_capacity=None):
             progress.finish_archive()
             progress.phase = 'complete'
             log(f'Restored stream {backup_id}: {reader.summary["data_bytes"]} bytes; checksums verified')
+            if archive_type == 'zfs' and reader.job['parent']:
+                log(f'Incremental stream: parent backup {reader.job["parent"]} must already be received.')
             return reader.summary
         except (BackupError, OSError):
             log('Stream restore failed; output may be partial. Discard it or roll back the downstream consumer.')
@@ -3935,7 +4031,7 @@ def restore_stream(backup_id, media, output, *, cartridge_capacity=None):
 def write_backup(source, media, level, base, volume_size, buffer_size, quiet,
                  snapshot_fd, estimated_bytes, remote, frame_size, *, excludes=None, zfs=None,
                  parent_job=None, verify=False, cartridge_capacity=None, stream=None, append_job=None):
-    job = {"id": uuid.uuid4().hex, "level": level, "parent": base, "source": str(source),
+    job = {"id": new_backup_id(media, parent_job, append_job), "level": level, "parent": base, "source": str(source),
            "created": datetime.now(timezone.utc).isoformat(), "estimated_bytes": estimated_bytes,
            **child_ancestry(parent_job)}
     if remote:
@@ -4352,7 +4448,7 @@ def inventory_document(entries):
         if not isinstance(entry, dict):
             raise BackupError('Invalid inventory entry')
         valid_id(entry.get('id'))
-        valid_id(entry.get('cartridge_id'))
+        valid_cartridge_id(entry.get('cartridge_id'))
         if entry.get('cartridge_label') is not None:
             valid_label(entry['cartridge_label'])
         if (type(entry.get('volume')) is not int or not 0 < entry['volume'] <= 100000 or
@@ -4612,6 +4708,8 @@ Native ZFS snapshots (existing snapshots; no file exclusions):
   zfs-backup --snapshot tank/books@next --base ID
   zfs-backup --snapshot tank/photos@daily --append-after LAST_ID
   zfs-restore --backup FULL_ID DELTA_ID --dataset tank/recovered
+  zfs-restore --backup ID --output snapshot.zfs
+  zfs-restore --backup ID --stdout | zfs receive -u tank/recovered
 
 Pipe streaming (arbitrary bytes; no remote helper required):
   producer | keeper stream-backup --name example --stdin
@@ -4709,12 +4807,19 @@ The final tape stays loaded until you run eject.''')
     zcreate.add_argument('--label-prefix', help='Label new cartridges PREFIX-001, PREFIX-002, etc.')
     ssh_options(zcreate)
     media_options(zcreate)
-    zextract = commands.add_parser('zfs-restore', help='Verify and receive native ZFS backups into an unmounted dataset')
+    zextract = commands.add_parser('zfs-restore', help='Receive native ZFS backups or export a send stream to a file')
     selection = zextract.add_mutually_exclusive_group(required=True)
     selection.add_argument('--backup', nargs='+', help='Full chain, or next incremental IDs')
     selection.add_argument('--to', help='Discover the full chain ending at this ID from cartridge metadata or --inventory')
-    zextract.add_argument('--plan', action='store_true', help='With --to, show the chain without receiving data')
-    zextract.add_argument('--dataset', metavar='POOL/DATASET', help='New dataset for a full restore')
+    zextract.add_argument('--plan', action='store_true', help='With --to, show the chain without restoring data')
+    ztarget = zextract.add_mutually_exclusive_group()
+    ztarget.add_argument('--dataset', metavar='POOL/DATASET', help='New dataset for a full restore')
+    ztarget.add_argument('--output', type=Path, metavar='FILE',
+                         help='Export one --backup ID as a verified send stream for later zfs receive; '
+                              'requires a new file, no ZFS installation needed')
+    ztarget.add_argument('--stdout', action='store_true',
+                         help='Pipe one --backup ID as its original ZFS send stream; '
+                              'no ZFS installation needed, output may be partial on failure')
     zextract.add_argument('--cartridge-capacity', type=parse_size,
                           help='Usable capacity for tape-count/ETA estimates (default: detect)')
     information_options(zextract)
@@ -4867,8 +4972,15 @@ def main(argv=None):
                 raise BackupError('--plan requires --to BACKUP_ID')
             if args.output_format and not args.plan:
                 raise BackupError('--json/--text on restore requires --plan')
-            if not args.plan and not (args.destination if args.command == 'restore' else args.dataset):
-                raise BackupError('Restore requires --destination' if args.command == 'restore' else 'ZFS restore requires --dataset')
+            if not args.plan:
+                if args.command == 'restore' and not args.destination:
+                    raise BackupError('Restore requires --destination')
+                if args.command == 'zfs-restore':
+                    if not (args.dataset or args.output or args.stdout):
+                        raise BackupError('ZFS restore requires --dataset, --output, or --stdout')
+                    if (args.output or args.stdout) and (args.to or len(args.backup) != 1):
+                        raise BackupError('--output/--stdout require --backup with exactly one ID; '
+                                          'export each full or incremental backup separately')
         inventory = (read_inventory(args.inventory)['backups'] if args.inventory and
                      (args.inventory.exists() or not creating) else [] if args.inventory else None)
         preview_only = (args.command in ('backup', 'zfs-backup') and args.dry_run and
@@ -4935,7 +5047,15 @@ def main(argv=None):
                                 buffer_size=args.buffer_size, quiet=args.quiet, ssh=ssh, verify=args.verify,
                                 dry_run=args.dry_run, cartridge_capacity=args.cartridge_capacity)
         elif args.command == 'zfs-restore':
-            result = restore_zfs(args.backup, args.dataset, media, cartridge_capacity=args.cartridge_capacity)
+            if args.stdout:
+                restore_stream(args.backup[0], media, sys.stdout.buffer, archive_type='zfs',
+                               cartridge_capacity=args.cartridge_capacity)
+                return 0  # stdout contains payload only, without a summary or newline.
+            elif args.output:
+                result = export_zfs(args.backup[0], args.output, media,
+                                    cartridge_capacity=args.cartridge_capacity)
+            else:
+                result = restore_zfs(args.backup, args.dataset, media, cartridge_capacity=args.cartridge_capacity)
         elif args.command == "restore":
             result = restore(args.backup, args.destination, media, quiet=args.quiet, base=args.base,
                              cartridge_capacity=args.cartridge_capacity)
@@ -4967,7 +5087,8 @@ def main(argv=None):
         return 0
     except BrokenPipeError:
         # Avoid a second buffered-stdout failure during interpreter shutdown.
-        if args is not None and args.command == 'stream-restore':
+        if args is not None and (args.command == 'stream-restore' or
+                                 (args.command == 'zfs-restore' and args.stdout)):
             with open(os.devnull, 'wb') as sink:
                 os.dup2(sink.fileno(), sys.stdout.fileno())
         log_error('Error: output pipe closed before the operation completed')
@@ -4987,6 +5108,12 @@ def main(argv=None):
         elif args is not None and args.command in ('restore', 'zfs-restore'):
             if args.plan:
                 log_error('Restore planning interrupted; no destination was modified.')
+            elif args.command == 'zfs-restore' and args.stdout:
+                log_error('ZFS stream export interrupted; output may be partial. '
+                          'Discard it or roll back the downstream consumer.')
+            elif args.command == 'zfs-restore' and args.output:
+                log_error('ZFS export interrupted. Only a fully verified stream can appear at the output path; '
+                          'retry with a new path if it was already published.')
             else:
                 log_error('Restore interrupted. If an incremental apply began, restore the full chain '
                     'into a separate directory; an incomplete apply cannot be continued.')

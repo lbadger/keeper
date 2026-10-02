@@ -92,7 +92,7 @@ class BinaryTests(unittest.TestCase):
         self.assertIn('file data was not verified', self.last_log)
 
     def test_relocated_binary_without_python_full_and_incremental_restore(self):
-        self.assertEqual(self.run_binary("--version"), "keeper 1.0.1")
+        self.assertEqual(self.run_binary("--version"), "keeper 1.1.0")
         self.assertIn("/dev/nst0", self.run_binary("backup", "--help"))
         self.assertNotIn('--volume-size', self.run_binary('backup', '--help'))
         full = self.run_binary(*self.backup_args)

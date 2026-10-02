@@ -21,11 +21,11 @@ staging an archive on disk. Backup metadata travels with the tapes.
 
 ## Install
 
-Download `keeper` and `keeper.sha256` from [v1.0.1](https://github.com/lbadger/keeper/releases/tag/v1.0.1):
+Download `keeper` and `keeper.sha256` from [v1.1.0](https://github.com/lbadger/keeper/releases/tag/v1.1.0):
 
 ```bash
-curl -fLO https://github.com/lbadger/keeper/releases/download/v1.0.1/keeper
-curl -fLO https://github.com/lbadger/keeper/releases/download/v1.0.1/keeper.sha256
+curl -fLO https://github.com/lbadger/keeper/releases/download/v1.1.0/keeper
+curl -fLO https://github.com/lbadger/keeper/releases/download/v1.1.0/keeper.sha256
 sha256sum --check keeper.sha256
 chmod +x keeper
 ./keeper --version
@@ -35,6 +35,7 @@ The release binary targets **Linux x86-64 with glibc 2.31 or newer** and zlib. I
 Python; it is not fully statically linked. The host needs GNU tar for file
 backups/restores and `mt` from `mt-st` for physical tape operations. SSH and
 native ZFS workflows additionally need OpenSSH and OpenZFS on the relevant hosts.
+Exporting a ZFS stream with `zfs-restore --output FILE` or `--stdout` does not need OpenZFS.
 On Debian/Ubuntu, the basic tools are installed with `sudo apt install tar mt-st`.
 
 Use an account with permission to operate the tape drive and read the source.
@@ -126,6 +127,11 @@ to capture the successful read-back result as `data_verified: true`.
 If read-back verification fails after a backup was committed, retain its tapes
 and retry `verify --backup ID`. The committed backup has not been erased.
 
+New backup IDs are **seven case-sensitive letters and digits**, for example
+`7aQm3Kx`. Copy them exactly for `--backup`, `--base`, `--append-after`, or `--to`.
+Existing 32-character IDs remain supported. Keep a shared `--inventory` to check
+new IDs against backups on offline cartridges as well.
+
 ## Back up ZFS snapshots
 
 These commands use **existing snapshots of one filesystem dataset**. Keeper does
@@ -143,6 +149,11 @@ not create snapshots, recursively replicate child datasets, or back up zvols.
 
 # Restore a chain into a new dataset whose parent pool/dataset already exists.
 ./keeper zfs-restore --backup PHOTOS_FULL_ID PHOTOS_DELTA_ID --dataset tank/recovered
+
+# Get a snapshot off tape on a machine without ZFS.
+./keeper zfs-restore --backup PHOTOS_FULL_ID --output /srv/recovery/photos-full.zfs
+# Later, on a ZFS machine:
+zfs receive -u tank/recovered < /srv/recovery/photos-full.zfs
 ```
 
 `--base` requires the same dataset, source host, and send mode. `--append-after`
@@ -152,8 +163,24 @@ restore dependency on that backup. The two options cannot be combined.
 Encrypted datasets require `--raw`. Incrementals inherit their parent's raw mode;
 an independent full needs its own `--raw` option. Keep the encryption keys separately.
 
-ZFS restore verifies before receiving, requiring two tape passes. The destination
+`--dataset` verifies before receiving, requiring two tape passes. The destination
 stays read-only and unmounted. See [ZFS restore and mounting](docs/reference.md#native-zfs-streaming).
+
+`--output FILE` exports the original send stream in one tape pass, with checksums
+and completion verified before the final file appears. It requires a new filename
+and no ZFS installation. Export each full or incremental backup separately, then
+receive the files in order. These files contain native ZFS streams, not extracted
+files; raw encrypted streams remain encrypted.
+
+For a direct pipe, use `--stdout` and check the whole pipeline's exit status:
+
+```bash
+set -o pipefail
+./keeper zfs-restore --backup PHOTOS_FULL_ID --stdout | zfs receive -u tank/recovered
+```
+
+Stdout contains only the original send stream. A later verification failure can
+leave partial output or an incomplete receive; check success before using the result.
 
 ## Back up over SSH
 
@@ -281,4 +308,4 @@ relying on it. Checksums detect corruption; they do not authenticate or encrypt
 ordinary file backups.
 
 See the [full reference](docs/reference.md), [streaming design](docs/continuous-streaming.md),
-[append design](docs/append-incrementals.md), and [release notes](docs/releases/v1.0.1.md).
+[append design](docs/append-incrementals.md), and [release notes](docs/releases/v1.1.0.md).

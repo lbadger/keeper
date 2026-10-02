@@ -1,5 +1,6 @@
 """Native stream framing plus opt-in OpenZFS kernel integration tests."""
 from contextlib import redirect_stderr, redirect_stdout
+import errno
 import io
 import json
 import os
@@ -17,6 +18,11 @@ import tape_backup as tb
 from ssh_fixture import SSHServer
 from test_append import TapeMedia
 from test_tape_backup import tree_contents
+
+
+ZFS_PAYLOAD = bytes(range(256)) * 3125
+CLI = ([os.environ['TAPE_BACKUP_BINARY']] if os.environ.get('TAPE_BACKUP_BINARY') else
+       [sys.executable, str(Path(tb.__file__).with_name('keeper.py'))])
 
 
 def identity(snapshot='tank/books@one', guid='1001', parent=None, raw=False):
@@ -43,7 +49,7 @@ class ZFSStreamTests(unittest.TestCase):
         def source(value):
             self.assertEqual(value, metadata)
             return tb.logged_process([sys.executable, '-c',
-                'import sys; sys.stdout.buffer.write(b"test zfs payload" * 50000); '
+                'import sys; sys.stdout.buffer.write(bytes(range(256)) * 3125); '
                 f'sys.exit({1 if fail else 0})'], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
         with patch.object(tb.shutil, 'which', return_value='/zfs'), \
                 patch.object(tb, 'zfs_properties', properties), \
@@ -300,6 +306,218 @@ class ZFSStreamTests(unittest.TestCase):
             with self.assertRaisesRegex(tb.BackupError, 'Another operation is restoring'):
                 tb.restore_zfs(['a' * 32], target, self.media)
 
+    def test_export_preserves_full_and_raw_bytes_across_tapes_without_zfs(self):
+        for number, (media, raw) in enumerate(((self.media, False), (TapeMedia(), True))):
+            with self.subTest(raw=raw):
+                self.media = media
+                backup_id = self.create(identity(raw=raw), raw=raw, limit=512 * 1024)
+                self.assertEqual(len(backup_id), 7)
+                self.assertGreater(media.last_result['volumes'], 1)
+                output = self.root / f'export-{number}' / 'snapshot.zfs'
+                errors = io.StringIO()
+                with patch.object(tb.shutil, 'which', side_effect=AssertionError('Required an external tool')), \
+                        patch.object(tb, 'run_command', side_effect=AssertionError('Ran an external tool')), \
+                        patch.object(tb, 'scan', side_effect=AssertionError('Made a second tape pass')), \
+                        redirect_stderr(errors):
+                    self.assertEqual(tb.export_zfs(backup_id, output, media), output)
+                self.assertEqual(output.read_bytes(), ZFS_PAYLOAD)
+                self.assertEqual(list(output.parent.iterdir()), [output])
+                self.assertIn('checksums verified', errors.getvalue())
+                self.assertEqual(errors.getvalue().count('Total 100.0% (complete)'), 1)
+
+    def test_export_incremental_alone_without_reading_parent_tapes(self):
+        metadata = identity()
+        full = self.create(metadata, limit=512 * 1024)
+        delta = self.create(identity('tank/books@two', '1002', metadata), base=full, limit=512 * 1024)
+        # The append may share the full's last cartridge, but needs none of its
+        # earlier cartridges to export the incremental's original stream.
+        (self.media.directory / f'{full}.0001.tape').unlink()
+        output = self.root / 'delta.zfs'
+        tb.export_zfs(delta, output, self.media)
+        self.assertEqual(output.read_bytes(), ZFS_PAYLOAD)
+
+    def test_export_rejects_existing_paths_and_media_overlap_before_reading(self):
+        existing = self.root / 'existing'
+        existing.write_bytes(b'keep me')
+        directory = self.root / 'directory'
+        directory.mkdir()
+        link = self.root / 'link'
+        link.symlink_to(self.root / 'missing')
+        media_alias = self.root / 'alias'
+        self.media.directory.mkdir()
+        media_alias.symlink_to(self.media.directory, target_is_directory=True)
+        for output in (existing, directory, link, self.media.directory / 'stream.zfs', media_alias / 'stream.zfs'):
+            with self.subTest(output=output), \
+                    patch.object(tb.StreamReader, 'next_volume', side_effect=AssertionError('Read tape')), \
+                    self.assertRaisesRegex(tb.BackupError, 'already exists|must be separate'):
+                tb.export_zfs('a' * 32, output, self.media)
+        self.assertEqual(existing.read_bytes(), b'keep me')
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(list(directory.iterdir()), [])
+
+    def test_export_holds_destination_lock(self):
+        output = self.root / 'stream.zfs'
+        with tb.restore_lock(output), \
+                patch.object(tb.StreamReader, 'next_volume', side_effect=AssertionError('Read tape')), \
+                self.assertRaisesRegex(tb.BackupError, 'Another operation is restoring'):
+            tb.export_zfs('a' * 32, output, self.media)
+
+    def test_failed_export_never_publishes_a_corrupt_or_incomplete_stream(self):
+        for failure in ('checksum', 'completion'):
+            with self.subTest(failure=failure):
+                self.media = tb.FileMedia(self.root / failure)
+                backup_id = self.create(identity())
+                tape = next(self.media.directory.glob('*.tape'))
+                with tape.open('r+b') as stream:
+                    if failure == 'checksum':
+                        stream.seek(4 * tb.BLOCK_SIZE)  # A later data frame, after some bytes were written.
+                        stream.write(b'!')
+                    else:
+                        while True:
+                            offset = stream.tell()
+                            record = stream.read(tb.BLOCK_SIZE)
+                            self.assertTrue(record, 'Missing fixture completion marker')
+                            if record.startswith(tb.MAGIC) and tb.decoded_header(record).get('kind') == 'end':
+                                stream.truncate(offset)
+                                break
+                output = self.root / f'{failure}.zfs'
+                with self.assertRaises(tb.BackupError):
+                    tb.export_zfs(backup_id, output, self.media)
+                self.assertFalse(output.exists())
+                self.assertFalse(list(self.root.glob(f'.{output.name}.restoring-*')))
+
+    def test_export_cleans_up_on_cancellation_and_disk_failure(self):
+        backup_id = self.create(identity())
+        output = self.root / 'stream.zfs'
+        for error in (KeyboardInterrupt(), OSError(errno.ENOSPC, 'No space left on device')):
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(tb.os, 'fsync', side_effect=error), self.assertRaises(type(error)):
+                tb.export_zfs(backup_id, output, self.media)
+            self.assertFalse(output.exists())
+            self.assertFalse(list(self.root.glob('.stream.zfs.restoring-*')))
+
+    def test_export_does_not_overwrite_a_file_created_during_the_read(self):
+        backup_id = self.create(identity())
+        output = self.root / 'stream.zfs'
+        frames = tb.StreamReader.frames
+        def competing_file(reader, **kwargs):
+            yield from frames(reader, **kwargs)
+            output.write_bytes(b'created while exporting')
+        with patch.object(tb.StreamReader, 'frames', competing_file), \
+                self.assertRaisesRegex(tb.BackupError, 'already exists'):
+            tb.export_zfs(backup_id, output, self.media)
+        self.assertEqual(output.read_bytes(), b'created while exporting')
+        self.assertFalse(list(self.root.glob('.stream.zfs.restoring-*')))
+
+    def test_export_rejects_tar_and_opaque_stream_backups(self):
+        source = self.root / 'source'
+        source.mkdir()
+        (source / 'file').write_text('data')
+        full = tb.backup(source, self.media, quiet=True)
+        stream_media = tb.FileMedia(self.root / 'stream-media')
+        opaque = tb.backup_stream('opaque', stream_media,
+                                  command=[sys.executable, '-c', 'print("opaque")'],
+                                  buffer_size=tb.BLOCK_SIZE)
+        for media, backup_id in ((self.media, full), (stream_media, opaque)):
+            output = self.root / f'{backup_id}.zfs'
+            with self.subTest(backup_id=backup_id), self.assertRaisesRegex(tb.BackupError, 'native ZFS backup'):
+                tb.export_zfs(backup_id, output, media)
+            self.assertFalse(output.exists())
+            self.assertFalse(list(self.root.glob(f'.{output.name}.restoring-*')))
+
+    def test_export_cli_without_zfs_and_rejects_ambiguous_targets(self):
+        backup_id = self.create(identity(), limit=512 * 1024)
+        output = self.root / 'snapshot.zfs'
+        result = subprocess.run([*CLI, 'zfs-restore', '--backup', backup_id,
+                                 '--output', str(output), '--media-dir', str(self.media.directory),
+                                 '--log-file', str(self.root / 'export.log')],
+                                env={**os.environ, 'PATH': ''}, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(output))
+        self.assertEqual(output.read_bytes(), ZFS_PAYLOAD)
+        with self.assertRaises(SystemExit) as error:
+            tb.make_parser().parse_args(['zfs-restore', '--backup', backup_id,
+                                         '--output', str(output), '--dataset', 'tank/recovered'])
+        self.assertEqual(error.exception.code, 2)
+        for selection in (['--backup', backup_id, 'b' * 32], ['--to', backup_id]):
+            with self.subTest(selection=selection), \
+                    patch.object(tb, 'FileMedia', side_effect=AssertionError('Opened media')):
+                self.assertEqual(tb.main(['zfs-restore', *selection, '--output', str(output),
+                                          '--media-dir', str(self.media.directory),
+                                          '--log-file', str(self.root / 'invalid.log')]), 1)
+
+    def test_stdout_cli_preserves_full_incremental_and_raw_bytes_without_zfs(self):
+        metadata = identity()
+        full = self.create(metadata, limit=512 * 1024)
+        delta = self.create(identity('tank/books@two', '1002', metadata), base=full, limit=512 * 1024)
+        raw = self.create(identity('tank/private@one', '2001', raw=True), raw=True,
+                          append_after=delta, limit=512 * 1024)
+        for backup_id in (full, delta, raw):
+            with self.subTest(backup_id=backup_id):
+                result = subprocess.run([*CLI, 'zfs-restore', '--backup', backup_id, '--stdout',
+                                         '--media-dir', str(self.media.directory),
+                                         '--log-file', str(self.root / f'{backup_id}.log')],
+                                        env={**os.environ, 'PATH': ''}, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, ZFS_PAYLOAD)
+
+    def test_stdout_missing_completion_marker_fails_after_delivering_payload(self):
+        backup_id = self.create(identity())
+        tape = next(self.media.directory.glob('*.tape'))
+        with tape.open('r+b') as stream:
+            while True:
+                offset = stream.tell()
+                record = stream.read(tb.BLOCK_SIZE)
+                self.assertTrue(record, 'Missing fixture completion marker')
+                if record.startswith(tb.MAGIC) and tb.decoded_header(record).get('kind') == 'end':
+                    stream.truncate(offset)
+                    break
+        result = subprocess.run([*CLI, 'zfs-restore', '--backup', backup_id, '--stdout',
+                                 '--media-dir', str(self.media.directory),
+                                 '--log-file', str(self.root / 'incomplete.log')],
+                                capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, ZFS_PAYLOAD)
+        self.assertNotIn(b'Traceback', result.stderr)
+        self.assertIn('output may be partial', (self.root / 'incomplete.log').read_text())
+
+    def test_stdout_broken_pipe_exits_cleanly_with_failure(self):
+        backup_id = self.create(identity())
+        process = subprocess.Popen([*CLI, 'zfs-restore', '--backup', backup_id, '--stdout',
+                                    '--media-dir', str(self.media.directory),
+                                    '--log-file', str(self.root / 'broken-pipe.log')],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process.stdout.close()
+        with process.stderr:
+            errors = process.stderr.read()
+        self.assertEqual(process.wait(timeout=10), 1, errors)
+        self.assertIn(b'output pipe closed', errors)
+        self.assertNotIn(b'Traceback', errors)
+
+    def test_stdout_rejects_terminal_wrong_archive_and_ambiguous_selection(self):
+        output = io.BytesIO()
+        with patch.object(output, 'isatty', return_value=True), \
+                patch.object(tb.StreamReader, 'next_volume', side_effect=AssertionError('Read tape')), \
+                self.assertRaisesRegex(tb.BackupError, 'Redirect zfs-restore --stdout'):
+            tb.restore_stream('7aQm3Kx', self.media, output, archive_type='zfs')
+        source = self.root / 'source'
+        source.mkdir()
+        (source / 'book').write_text('tar file')
+        backup_id = tb.backup(source, self.media, quiet=True)
+        with self.assertRaisesRegex(tb.BackupError, 'native ZFS backup'):
+            tb.restore_stream(backup_id, self.media, output, archive_type='zfs')
+        self.assertEqual(output.getvalue(), b'')
+        for target in (['--dataset', 'tank/recovered'], ['--output', 'snapshot.zfs']):
+            with self.subTest(target=target), self.assertRaises(SystemExit) as error:
+                tb.make_parser().parse_args(['zfs-restore', '--backup', backup_id, '--stdout', *target])
+            self.assertEqual(error.exception.code, 2)
+        for selection in (['--backup', backup_id, 'b' * 32], ['--to', backup_id]):
+            with self.subTest(selection=selection), \
+                    patch.object(tb, 'FileMedia', side_effect=AssertionError('Opened media')):
+                self.assertEqual(tb.main(['zfs-restore', *selection, '--stdout',
+                                          '--media-dir', str(self.media.directory),
+                                          '--log-file', str(self.root / 'invalid-pipe.log')]), 1)
+
 
 class ZFSSSHTests(unittest.TestCase):
     def test_real_ssh_transport_streams_native_full_and_incremental_sources(self):
@@ -433,6 +651,24 @@ class ZFSKernelTests(unittest.TestCase):
         self.assertNotEqual(tb.zfs_properties(destination, ['encryption'])['encryption'], 'off')
         subprocess.run(['zfs', 'load-key', '-L', f'file://{key}', destination], check=True)
         self.assertEqual(tree_contents(self.view(destination, 'raw-restored')), tree_contents(source))
+
+    def test_real_exported_full_and_incremental_files_can_be_received_later(self):
+        full = tb.backup_zfs(self.snapshot('one'), self.media, buffer_size=tb.BLOCK_SIZE,
+                             volume_size=512 * 1024)
+        (self.source / 'deleted').unlink()
+        (self.source / 'book').write_text('changed after the full snapshot')
+        delta = tb.backup_zfs(self.snapshot('two'), self.media, base=full, buffer_size=tb.BLOCK_SIZE,
+                              volume_size=512 * 1024)
+        destination = self.dataset + '/exported'
+        for backup_id in (full, delta):
+            output = self.root / f'{backup_id}.zfs'
+            with patch.object(tb.shutil, 'which', return_value=None), \
+                    patch.object(tb, 'run_command', side_effect=AssertionError('Export used ZFS')):
+                tb.export_zfs(backup_id, output, self.media)
+            with output.open('rb') as stream:
+                subprocess.run(['zfs', 'receive', '-u', '-o', 'readonly=on', '-o', 'mountpoint=none',
+                                destination], stdin=stream, check=True)
+        self.assertEqual(tree_contents(self.view(destination, 'exported')), tree_contents(self.source))
 
     def test_real_independent_datasets_share_cartridge_and_restore_separately(self):
         first = tb.backup_zfs(self.snapshot('one'), self.media, buffer_size=tb.BLOCK_SIZE)
